@@ -7,7 +7,7 @@
  * optional IRQ-driven RX into a single interface.
  *
  * The library is protocol-agnostic. Incoming bytes are reassembled
- * into length-prefixed frames — the library delivers the raw payload
+ * into length-prefixed frames -- the library delivers the raw payload
  * to your callback and makes no assumptions about its contents.
  * Bring your own protocol (SCP, chat, game state, whatever).
  *
@@ -27,7 +27,7 @@
  *       // ... SGL init, VDP setup, etc ...
  *
  *       saturn_online_config_t cfg = SATURN_ONLINE_DEFAULTS;
- *       cfg.dial_number = "0000000";   // whatever the bridge answers
+ *       cfg.dial_number = "#555#";      // whatever the bridge answers
  *       cfg.on_frame    = on_frame;
  *       cfg.on_status   = on_status;
  *
@@ -56,9 +56,9 @@
  *   - Connection statistics tracking
  *
  * Dependencies:
- *   - saturn_online/uart.h   (UART driver — inlined)
- *   - saturn_online/modem.h  (AT command layer — inlined)
- *   - saturn_online/framing.h (length-prefixed frame reassembly — inlined)
+ *   - saturn_online/uart.h   (UART driver -- inlined)
+ *   - saturn_online/modem.h  (AT command layer -- inlined)
+ *   - saturn_online/framing.h (length-prefixed frame reassembly -- inlined)
  *
  * Thread safety: None. Call all functions from the same context (main loop).
  */
@@ -69,6 +69,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Forward declaration -- callers may pass a UART pointer without needing
+ * saturn_online/uart.h on their include path. */
+struct saturn_uart16550;
+typedef struct saturn_uart16550 saturn_uart16550_t;
+
 /*============================================================================
  * Connection States
  *============================================================================*/
@@ -77,7 +82,6 @@ typedef enum {
     SATURN_ONLINE_STATE_IDLE = 0,      /* Not initialized or shut down */
     SATURN_ONLINE_STATE_DETECTING,     /* Scanning for modem hardware */
     SATURN_ONLINE_STATE_PROBING,       /* Sending AT commands to find baud rate */
-    SATURN_ONLINE_STATE_INITIALIZING,  /* Running modem init sequence */
     SATURN_ONLINE_STATE_CONNECTING,    /* Dialing or waiting for incoming call */
     SATURN_ONLINE_STATE_CONNECTED,     /* Link established, exchanging data */
     SATURN_ONLINE_STATE_DISCONNECTED,  /* Carrier lost, link down */
@@ -131,7 +135,7 @@ typedef struct {
 /**
  * Called when a complete length-prefixed frame arrives.
  *
- * The payload is the raw bytes inside the frame — the library makes
+ * The payload is the raw bytes inside the frame -- the library makes
  * no assumption about the first byte or any of the contents. Your
  * protocol lives here.
  *
@@ -176,15 +180,20 @@ typedef enum {
 } saturn_online_mode_t;
 
 /**
- * Configuration structure. Initialize with SATURN_ONLINE_DEFAULTS and then
- * override individual fields.
+ * Configuration structure. Initialize with SATURN_ONLINE_DEFAULTS and
+ * then override individual fields.
+ *
+ * Phase 1 keeps the original flat shape aside from renaming
+ * `dial_timeout` (loop-iterations) to `dial_timeout_secs` (seconds).
+ * Phase 2 will move the less-common knobs into a nested `advanced`
+ * struct.
  */
 typedef struct {
     /* Connection */
-    const char*           dial_number;    /* Phone number to dial (mode=DIAL) */
-    saturn_online_mode_t  mode;           /* DIAL or ANSWER */
-    uint32_t              dial_timeout;   /* Dial/answer timeout in loop iterations */
-    bool                  auto_reconnect; /* Reconnect on carrier loss */
+    const char*           dial_number;       /* Phone number to dial (mode=DIAL) */
+    saturn_online_mode_t  mode;              /* DIAL or ANSWER */
+    uint32_t              dial_timeout_secs; /* Dial/answer timeout in seconds */
+    bool                  auto_reconnect;    /* Reconnect on carrier loss */
     int                   max_reconnect_attempts; /* 0 = unlimited */
 
     /* DCD monitoring */
@@ -218,20 +227,24 @@ typedef struct {
 /**
  * Default configuration values.
  * Usage: saturn_online_config_t cfg = SATURN_ONLINE_DEFAULTS;
+ *
+ * `dial_number` intentionally left NULL so saturn_online_init() rejects
+ * unconfigured callers with SATURN_ONLINE_ERR_INVALID_CONFIG. Every
+ * caller must supply a real dial number (e.g. "#555#") before init.
  */
 #define SATURN_ONLINE_DEFAULTS { \
-    .dial_number            = "0000000",   /* placeholder — override me */ \
+    .dial_number            = 0,                   \
     .mode                   = SATURN_ONLINE_MODE_DIAL, \
-    .dial_timeout           = 180000000,   /* ~60s */ \
-    .auto_reconnect         = false,       \
-    .max_reconnect_attempts = 3,           \
-    .monitor_dcd            = true,        \
-    .use_irq                = false,       \
-    .max_bytes_per_poll     = 0,           \
-    .on_frame               = 0,           \
-    .on_state               = 0,           \
-    .on_status              = 0,           \
-    .user                   = 0            \
+    .dial_timeout_secs      = 60,                  \
+    .auto_reconnect         = false,               \
+    .max_reconnect_attempts = 3,                   \
+    .monitor_dcd            = true,                \
+    .use_irq                = false,               \
+    .max_bytes_per_poll     = 0,                   \
+    .on_frame               = 0,                   \
+    .on_state               = 0,                   \
+    .on_status              = 0,                   \
+    .user                   = 0                    \
 }
 
 /*============================================================================
@@ -241,11 +254,16 @@ typedef struct {
 /**
  * Initialize the networking subsystem.
  *
- * Must be called before any other saturn_online_* function. on_frame is
- * required; all other callbacks are optional.
+ * Must be called before any other saturn_online_* function. Required
+ * config fields:
+ *   - on_frame (callback)
+ *   - dial_number when mode == DIAL and no transport override is given.
+ *     Must not be NULL, empty, or the historical placeholder "0000000".
  *
  * @param config  Configuration (copied internally).
- * @return SATURN_ONLINE_OK on success
+ * @return SATURN_ONLINE_OK on success; SATURN_ONLINE_ERR_INVALID_CONFIG
+ *         if the dial number is missing/placeholder or on_frame is NULL;
+ *         SATURN_ONLINE_ERR_ALREADY_INIT if called twice.
  */
 saturn_online_status_t saturn_online_init(const saturn_online_config_t* config);
 
@@ -257,6 +275,9 @@ saturn_online_status_t saturn_online_init(const saturn_online_config_t* config);
  *   2. Probe modem with AT commands at multiple baud rates
  *   3. Initialize modem (ATZ, ATE0, ATX3, ATV1)
  *   4. Dial out (or wait for answer, depending on mode)
+ *
+ * When a transport override is supplied the above steps are skipped and
+ * the library immediately enters CONNECTED state using that transport.
  *
  * Status messages are reported via on_status callback. This function
  * blocks until the connection is established or fails.
@@ -270,8 +291,9 @@ saturn_online_status_t saturn_online_connect(void);
  *
  * Reads available UART bytes, feeds them to the frame receiver, and
  * invokes on_frame for each complete length-prefixed frame. Also
- * checks DCD if monitor_dcd is enabled, and initiates reconnection
- * if auto_reconnect is enabled and carrier was lost.
+ * checks DCD if monitor_dcd is enabled, drains a pending TX buffer,
+ * emits heartbeats if configured, and initiates reconnection if
+ * auto_reconnect is enabled and carrier was lost.
  *
  * Safe to call when not connected (returns immediately).
  *
@@ -288,24 +310,17 @@ saturn_online_status_t saturn_online_poll(void);
  * The library makes no assumptions about the payload contents. Use
  * this for any protocol message your game defines.
  *
+ * If a TX buffer is configured (advanced.tx_buffer_size > 0), this
+ * copies into the buffer and returns immediately -- the bytes are
+ * drained by subsequent calls to saturn_online_poll(). If the buffer
+ * is full, returns SATURN_ONLINE_ERR_WOULDBLOCK. Otherwise sends
+ * synchronously.
+ *
  * @param payload  Payload bytes
  * @param len      Payload length (1..SATURN_ONLINE_MAX_PAYLOAD)
  * @return SATURN_ONLINE_OK on success
  */
 saturn_online_status_t saturn_online_send(const uint8_t* payload, uint16_t len);
-
-/**
- * Send raw bytes over UART without framing.
- *
- * Use this if you're building frames yourself or need to emit
- * non-framed bytes (e.g. a sync preamble). Most callers want
- * saturn_online_send() instead.
- *
- * @param data  Bytes to send
- * @param len   Number of bytes
- * @return SATURN_ONLINE_OK on success
- */
-saturn_online_status_t saturn_online_send_raw(const uint8_t* data, uint16_t len);
 
 /**
  * Disconnect (hang up modem).
@@ -366,21 +381,34 @@ const char* saturn_online_status_name(saturn_online_status_t status);
  */
 uint16_t saturn_online_irq_pending(void);
 
+/**
+ * Copy the most recent modem response text into the supplied buffer.
+ *
+ * Returns the number of bytes written (excluding the null terminator).
+ * Useful for displaying AT errors to the user during connect.
+ *
+ * @param buf  Destination (null-terminated on return)
+ * @param len  Buffer length; must be >= 1
+ * @return bytes written (0 if no response has been captured yet)
+ */
+int saturn_online_last_modem_response(char* buf, int len);
+
 /*============================================================================
  * Advanced / Low-Level Access
  *============================================================================*/
 
 /**
- * Get a pointer to the underlying UART instance (saturn_uart16550_t*).
+ * Get a pointer to the underlying UART instance.
  *
- * Returned as const void* so callers don't need to include uart.h just
- * to pass this pointer around. Cast to `const saturn_uart16550_t*` for
- * direct register access (loopback tests, custom probes, etc.).
- * Returns NULL if not initialized or no modem was detected.
+ * Returns NULL if not initialized, no modem was detected, or a non-UART
+ * transport override is active. Callers who need direct register access
+ * (loopback tests, custom probes) can use the returned pointer without
+ * including <saturn_online/uart.h> on their include path -- `net.h`
+ * forward-declares the UART type.
  *
  * WARNING: Modifying UART state while connected may break the link.
  */
-const void* saturn_online_get_uart(void);
+const saturn_uart16550_t* saturn_online_get_uart(void);
 
 /**
  * Manually trigger a reconnection attempt.

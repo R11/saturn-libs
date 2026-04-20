@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+*.o
+*.elf
+*.iso
+*.cue
+*.map
+*.raw
+
+# Host-side unit test binaries
+tests/host/test_*
+!tests/host/test_*.c
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

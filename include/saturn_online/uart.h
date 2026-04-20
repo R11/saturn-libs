@@ -41,7 +41,7 @@
  * UART Instance — configurable base address and stride
  * ========================================================================= */
 
-typedef struct {
+typedef struct saturn_uart16550 {
     uint32_t base;    /* Register base address (e.g. 0x25895001) */
     uint32_t stride;  /* Bytes between registers (e.g. 4) */
 } saturn_uart16550_t;

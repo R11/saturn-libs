@@ -7,6 +7,11 @@
  * file-backed capture, or a future DreamPi direct-socket backend
  * without touching their own protocol logic.
  *
+ * Starting in Phase 2, `saturn_online_init()` accepts an optional
+ * `transport` pointer in the config. When non-NULL the library
+ * skips modem detection/probe/dial and treats the connection as
+ * already-open via the provided callbacks.
+ *
  * Shape borrowed from flickys-flock-netlink/net/net_transport.h,
  * which in turn came from the CUI Platform Abstraction Layer.
  */
@@ -17,7 +22,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-typedef struct net_transport {
+typedef struct saturn_online_transport {
     /**
      * Check if at least one byte is available to read.
      * Non-blocking.
@@ -44,29 +49,33 @@ typedef struct net_transport {
     /** Opaque context pointer passed to all callbacks. */
     void* ctx;
 
-} net_transport_t;
+} saturn_online_transport_t;
 
 /*============================================================================
  * Convenience Helpers
  *============================================================================*/
 
-static inline bool net_transport_rx_ready(const net_transport_t* t)
+static inline bool
+saturn_online_transport_rx_ready(const saturn_online_transport_t* t)
 {
     return (t && t->rx_ready) ? t->rx_ready(t->ctx) : false;
 }
 
-static inline uint8_t net_transport_rx_byte(const net_transport_t* t)
+static inline uint8_t
+saturn_online_transport_rx_byte(const saturn_online_transport_t* t)
 {
     return (t && t->rx_byte) ? t->rx_byte(t->ctx) : 0;
 }
 
-static inline int net_transport_send(const net_transport_t* t,
-                                     const uint8_t* data, int len)
+static inline int
+saturn_online_transport_send(const saturn_online_transport_t* t,
+                              const uint8_t* data, int len)
 {
     return (t && t->send) ? t->send(t->ctx, data, len) : -1;
 }
 
-static inline bool net_transport_is_connected(const net_transport_t* t)
+static inline bool
+saturn_online_transport_is_connected(const saturn_online_transport_t* t)
 {
     if (!t) return false;
     return t->is_connected ? t->is_connected(t->ctx) : true;

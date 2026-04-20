@@ -64,7 +64,9 @@ static void on_frame(const uint8_t* payload, uint16_t len, void* user)
 void ss_main(void)
 {
     saturn_online_config_t cfg = SATURN_ONLINE_DEFAULTS;
-    cfg.dial_number  = "0000000";   /* bridge answers whatever we dial */
+    cfg.dial_number  = "#555#";     /* bridge answers whatever we dial; the
+                                       previous "0000000" placeholder is now
+                                       rejected by saturn_online_init */
     cfg.on_frame     = on_frame;
     cfg.on_status    = on_status;
 

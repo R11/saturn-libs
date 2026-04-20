@@ -2,7 +2,7 @@
  * net.c - saturn-online core implementation
  *
  * Extracted from saturn-tools' saturn/lib/net/saturn_net.c with all
- * SCP (canvas_protocol.h) coupling removed. Incoming UART bytes are
+ * SCP (canvas_protocol.h) coupling removed. Incoming bytes are
  * reassembled into length-prefixed frames via saturn_online_frame_*;
  * the payload is delivered to on_frame without interpretation.
  *
@@ -15,6 +15,7 @@
 #include "saturn_online/uart.h"
 #include "saturn_online/modem.h"
 #include "saturn_online/framing.h"
+#include "saturn_online_internal.h"
 
 #include <string.h>
 
@@ -42,23 +43,18 @@ static const struct {
     (int)(sizeof(s_modem_addrs) / sizeof(s_modem_addrs[0]))
 
 /*============================================================================
- * Interrupt-Driven RX — Ring Buffer
+ * Interrupt-Driven RX -- Ring Buffer
  *
  * Single-producer (ISR writes head) / single-consumer (poll reads tail).
  * Power-of-2 size for fast index masking. No lock needed.
  *
  * At 9600 baud (960 bytes/sec) and 60 fps, ~16 bytes arrive per frame.
  * A 512-byte buffer gives ~32 frames of headroom before overflow.
+ *
+ * The struct type lives in saturn_online_internal.h so other TUs
+ * (Phase 3's connect_async.c) can inspect state through the shared
+ * singleton.
  *============================================================================*/
-
-#define SATURN_ONLINE_RINGBUF_SIZE  512   /* Must be power of 2 */
-#define SATURN_ONLINE_RINGBUF_MASK  (SATURN_ONLINE_RINGBUF_SIZE - 1)
-
-typedef struct {
-    volatile uint8_t  buf[SATURN_ONLINE_RINGBUF_SIZE];
-    volatile uint16_t head;       /* Next write position (ISR only) */
-    volatile uint16_t tail;       /* Next read position (main loop only) */
-} saturn_online_ringbuf_t;
 
 static inline void ringbuf_reset(saturn_online_ringbuf_t* rb) {
     rb->head = 0;
@@ -73,6 +69,13 @@ static inline bool ringbuf_empty(const saturn_online_ringbuf_t* rb) {
     return rb->head == rb->tail;
 }
 
+/*
+ * ringbuf_put is only called from the Saturn UART ISR. On non-Saturn
+ * hosts the ISR is absent, so ringbuf_put would be an unused static and
+ * the compiler emits -Wunused-function. Gate the producer helper behind
+ * __SATURN__ to keep host-side builds clean.
+ */
+#if defined(__SATURN__)
 static inline bool ringbuf_put(saturn_online_ringbuf_t* rb, uint8_t byte) {
     uint16_t next = (rb->head + 1) & SATURN_ONLINE_RINGBUF_MASK;
     if (next == rb->tail) return false; /* full */
@@ -80,6 +83,7 @@ static inline bool ringbuf_put(saturn_online_ringbuf_t* rb, uint8_t byte) {
     rb->head = next;
     return true;
 }
+#endif
 
 static inline uint8_t ringbuf_get(saturn_online_ringbuf_t* rb) {
     uint8_t byte = rb->buf[rb->tail];
@@ -89,26 +93,73 @@ static inline uint8_t ringbuf_get(saturn_online_ringbuf_t* rb) {
 
 /*============================================================================
  * Internal State
+ *
+ * Struct definition lives in saturn_online_internal.h; this is the
+ * single instance.
  *============================================================================*/
 
-static struct {
-    bool                        initialized;
-    saturn_online_config_t      config;
-    saturn_online_state_t       state;
-    saturn_online_stats_t       stats;
-    saturn_uart16550_t          uart;
-    saturn_online_frame_rx_t    rx;
-    bool                        uart_found;
-    int                         reconnect_attempts;
-    saturn_online_ringbuf_t     ringbuf;
-    bool                        irq_active;     /* true when ISR is installed */
-#if defined(__SATURN__)
-    uint32_t                    saved_vector;   /* Previous ISR at vector 0x5C */
-#endif
-} s_net;
+struct saturn_online_net_s s_net;
 
 /*============================================================================
- * Interrupt-Driven RX — Saturn Hardware Setup
+ * Modem diagnostics storage (replaces static globals in modem.h)
+ *============================================================================*/
+
+void saturn_online_modem_record_response(const char* response, int len) {
+    if (len < 0) len = 0;
+    if (len >= (int)sizeof(s_net.last_modem_response)) {
+        len = (int)sizeof(s_net.last_modem_response) - 1;
+    }
+    memcpy(s_net.last_modem_response, response, (size_t)len);
+    s_net.last_modem_response[len] = '\0';
+    s_net.last_modem_response_len = len;
+}
+
+void saturn_online_modem_record_probe_divisor(uint16_t divisor) {
+    s_net.probe_baud_divisor = divisor;
+}
+
+uint16_t saturn_online_modem_get_probe_divisor(void) {
+    return s_net.probe_baud_divisor;
+}
+
+int saturn_online_last_modem_response(char* buf, int len) {
+    if (!buf || len <= 0) return 0;
+    int n = s_net.last_modem_response_len;
+    if (n >= len) n = len - 1;
+    if (n > 0) memcpy(buf, s_net.last_modem_response, (size_t)n);
+    buf[n] = '\0';
+    return n;
+}
+
+/*============================================================================
+ * Wall-clock timeout conversion
+ *
+ * The public API uses seconds for timeouts; the underlying AT busy loops
+ * use opaque "loop iterations". The reference build is calibrated so
+ * ~3,000,000 iterations per second produces the familiar 60 s / 180M-iter
+ * behavior. Emulator speed and cache state can drift this number in
+ * either direction; that drift was present before seconds was exposed
+ * and is documented as "approximate".
+ *
+ * A later refinement can read the SH-2 Free-Running Timer (FRT, registers
+ * 0xFFFFFE12/0xFFFFFE13) to calibrate at init time. The deliberate
+ * simplification here is that FRT clock dividers can be changed by the
+ * game after init, which would invalidate a cached calibration. Sticking
+ * with the classic busy-wait heuristic keeps the library's behavior
+ * identical to the pre-Phase-1 baseline when the game hasn't asked for
+ * anything unusual.
+ *============================================================================*/
+
+static uint32_t seconds_to_loop_iters(uint32_t secs) {
+    /* Reference: 60 s  ->  180,000,000 iters */
+    const uint32_t iters_per_sec = 3000000UL;
+    if (secs == 0) secs = 1;
+    if (secs > 600) secs = 600;  /* hard cap at 10 minutes */
+    return secs * iters_per_sec;
+}
+
+/*============================================================================
+ * Interrupt-Driven RX -- Saturn Hardware Setup
  *
  * The NetLink UART fires SCU External Interrupt 12 (vector 0x5C).
  * The ISR drains the UART FIFO into the ring buffer. The main-loop
@@ -242,8 +293,8 @@ static void irq_teardown(void) { }
  *============================================================================*/
 
 /** Transition to a new state, firing the callback. */
-static void set_state(saturn_online_state_t new_state,
-                       saturn_online_status_t status)
+void saturn_online_set_state(saturn_online_state_t new_state,
+                              saturn_online_status_t status)
 {
     saturn_online_state_t old = s_net.state;
     if (old == new_state) return;
@@ -254,7 +305,7 @@ static void set_state(saturn_online_state_t new_state,
 }
 
 /** Report a status message to the user. */
-static void report(const char* msg)
+void saturn_online_report(const char* msg)
 {
     if (s_net.config.on_status) {
         s_net.config.on_status(msg, s_net.config.user);
@@ -274,11 +325,11 @@ static bool detect_modem(void)
 
     for (pass = 0; pass < 2; pass++) {
         if (pass == 0) {
-            report("Powering on modem...");
+            saturn_online_report("Powering on modem...");
             saturn_netlink_smpc_enable();
-            report("Modem powered on");
+            saturn_online_report("Modem powered on");
         } else {
-            report("Extended settle...");
+            saturn_online_report("Extended settle...");
             for (volatile uint32_t d = 0; d < 4000000; d++);
         }
 
@@ -292,17 +343,18 @@ static bool detect_modem(void)
             if (r.detected) {
                 s_net.uart = probe;
                 s_net.uart_found = true;
-                report("Modem found");
+                saturn_online_report("Modem found");
                 return true;
             }
 
-            /* SCR test failed but LSR looks live — try AT probe */
+            /* SCR test failed but LSR looks live -- try AT probe */
             if (r.lsr != 0xFF && r.lsr != 0x00 &&
                 (r.lsr & (SATURN_UART_LSR_THRE | SATURN_UART_LSR_TEMT))) {
                 s_net.uart = probe;
-                if (modem_probe(&s_net.uart) == MODEM_OK) {
+                if (saturn_online_modem_probe(&s_net.uart)
+                        == SATURN_ONLINE_MODEM_OK) {
                     s_net.uart_found = true;
-                    report("Modem found (AT)");
+                    saturn_online_report("Modem found (AT)");
                     return true;
                 }
             }
@@ -317,22 +369,22 @@ static bool detect_modem(void)
  */
 static saturn_online_status_t probe_and_init_modem(void)
 {
-    report("Probing modem...");
+    saturn_online_report("Probing modem...");
 
-    if (modem_probe(&s_net.uart) != MODEM_OK) {
-        report("No modem response");
+    if (saturn_online_modem_probe(&s_net.uart) != SATURN_ONLINE_MODEM_OK) {
+        saturn_online_report("No modem response");
         return SATURN_ONLINE_ERR_NO_RESPONSE;
     }
 
-    s_net.stats.baud_rate = modem_get_probe_baud();
-    report("Initializing modem...");
+    s_net.stats.baud_rate = saturn_online_modem_get_probe_baud();
+    saturn_online_report("Initializing modem...");
 
-    if (modem_init(&s_net.uart) != MODEM_OK) {
-        report("Modem init failed");
+    if (saturn_online_modem_init(&s_net.uart) != SATURN_ONLINE_MODEM_OK) {
+        saturn_online_report("Modem init failed");
         return SATURN_ONLINE_ERR_INIT_FAILED;
     }
 
-    report("Modem ready");
+    saturn_online_report("Modem ready");
     return SATURN_ONLINE_OK;
 }
 
@@ -341,34 +393,34 @@ static saturn_online_status_t probe_and_init_modem(void)
  */
 static saturn_online_status_t do_dial(void)
 {
-    modem_result_t result;
+    saturn_online_modem_result_t result;
 
-    report("Dialing...");
-    result = modem_dial(&s_net.uart,
-                         s_net.config.dial_number,
-                         s_net.config.dial_timeout);
+    saturn_online_report("Dialing...");
+    result = saturn_online_modem_dial(&s_net.uart,
+                                       s_net.config.dial_number,
+                                       s_net.dial_timeout_iters);
 
     switch (result) {
-    case MODEM_CONNECT:
-        modem_flush_input(&s_net.uart);
+    case SATURN_ONLINE_MODEM_CONNECT:
+        saturn_online_modem_flush_input(&s_net.uart);
         return SATURN_ONLINE_OK;
-    case MODEM_NO_CARRIER:
-        report("No carrier");
+    case SATURN_ONLINE_MODEM_NO_CARRIER:
+        saturn_online_report("No carrier");
         return SATURN_ONLINE_ERR_NO_CARRIER;
-    case MODEM_BUSY:
-        report("Busy");
+    case SATURN_ONLINE_MODEM_BUSY:
+        saturn_online_report("Busy");
         return SATURN_ONLINE_ERR_BUSY;
-    case MODEM_NO_DIALTONE:
-        report("No dial tone");
+    case SATURN_ONLINE_MODEM_NO_DIALTONE:
+        saturn_online_report("No dial tone");
         return SATURN_ONLINE_ERR_NO_DIALTONE;
-    case MODEM_NO_ANSWER:
-        report("No answer");
+    case SATURN_ONLINE_MODEM_NO_ANSWER:
+        saturn_online_report("No answer");
         return SATURN_ONLINE_ERR_NO_ANSWER;
-    case MODEM_TIMEOUT_ERR:
-        report("Dial timeout");
+    case SATURN_ONLINE_MODEM_TIMEOUT_ERR:
+        saturn_online_report("Dial timeout");
         return SATURN_ONLINE_ERR_TIMEOUT;
     default:
-        report("Dial failed");
+        saturn_online_report("Dial failed");
         return SATURN_ONLINE_ERR_NO_CARRIER;
     }
 }
@@ -378,39 +430,41 @@ static saturn_online_status_t do_dial(void)
  */
 static saturn_online_status_t do_answer(void)
 {
-    char buf[MODEM_LINE_MAX];
-    modem_result_t result;
+    char buf[SATURN_ONLINE_MODEM_LINE_MAX];
+    saturn_online_modem_result_t result;
 
-    report("Waiting for call...");
+    saturn_online_report("Waiting for call...");
 
     /* Enable auto-answer */
-    result = modem_command_timeout(&s_net.uart, "ATS0=1", buf, sizeof(buf),
-                                    s_net.config.dial_timeout);
-    if (result != MODEM_OK) {
-        report("Auto-answer setup failed");
+    result = saturn_online_modem_command_timeout(
+        &s_net.uart, "ATS0=1", buf, sizeof(buf), s_net.dial_timeout_iters);
+    if (result != SATURN_ONLINE_MODEM_OK) {
+        saturn_online_report("Auto-answer setup failed");
         return SATURN_ONLINE_ERR_INIT_FAILED;
     }
 
     /* Wait for CONNECT */
     while (1) {
-        int len = modem_read_line(&s_net.uart, buf, sizeof(buf),
-                                   s_net.config.dial_timeout);
+        int len = saturn_online_modem_read_line(
+            &s_net.uart, buf, sizeof(buf), s_net.dial_timeout_iters);
         if (len < 0) {
-            report("Answer timeout");
+            saturn_online_report("Answer timeout");
             return SATURN_ONLINE_ERR_TIMEOUT;
         }
         if (len == 0) continue;
 
-        modem_result_t r = modem_parse_response(buf);
-        if (r == MODEM_CONNECT) {
-            modem_flush_input(&s_net.uart);
+        saturn_online_modem_result_t r =
+            saturn_online_modem_parse_response(buf);
+        if (r == SATURN_ONLINE_MODEM_CONNECT) {
+            saturn_online_modem_flush_input(&s_net.uart);
             return SATURN_ONLINE_OK;
         }
-        if (r == MODEM_NO_CARRIER || r == MODEM_ERROR) {
-            report("Answer failed");
+        if (r == SATURN_ONLINE_MODEM_NO_CARRIER
+                || r == SATURN_ONLINE_MODEM_ERROR) {
+            saturn_online_report("Answer failed");
             return SATURN_ONLINE_ERR_NO_CARRIER;
         }
-        /* RING or other — keep waiting */
+        /* RING or other -- keep waiting */
     }
 }
 
@@ -436,25 +490,34 @@ static bool check_carrier(void)
 }
 
 /**
- * Full reconnect sequence: hangup, re-probe, re-init, re-dial.
+ * Full reconnect sequence: escape-to-command, hangup, re-probe, re-init,
+ * re-dial.
  */
 static saturn_online_status_t do_reconnect_internal(void)
 {
-    char buf[MODEM_LINE_MAX];
+    char buf[SATURN_ONLINE_MODEM_LINE_MAX];
     saturn_online_status_t status;
 
-    set_state(SATURN_ONLINE_STATE_RECONNECTING, SATURN_ONLINE_ERR_CARRIER_LOST);
+    saturn_online_set_state(SATURN_ONLINE_STATE_RECONNECTING,
+                             SATURN_ONLINE_ERR_CARRIER_LOST);
 
     /* Disable IRQ during AT command mode */
     irq_teardown();
 
-    report("Hanging up...");
-    modem_command(&s_net.uart, "ATH0", buf, sizeof(buf));
+    /* Escape-to-command BEFORE the hangup AT command. If the modem is
+     * still in data mode after a carrier dropout, sending ATH0 without
+     * escaping first will be consumed as payload and hang the AT
+     * exchange. Matches saturn_online_disconnect(). */
+    saturn_online_report("Escape to command...");
+    saturn_online_modem_escape_to_command(&s_net.uart);
+
+    saturn_online_report("Hanging up...");
+    saturn_online_modem_command(&s_net.uart, "ATH0", buf, sizeof(buf));
 
     status = probe_and_init_modem();
     if (status != SATURN_ONLINE_OK) return status;
 
-    report("Re-dialing...");
+    saturn_online_report("Re-dialing...");
     if (s_net.config.mode == SATURN_ONLINE_MODE_DIAL) {
         status = do_dial();
     } else {
@@ -471,7 +534,7 @@ static saturn_online_status_t do_reconnect_internal(void)
     }
 
     s_net.stats.reconnections++;
-    report("Reconnected");
+    saturn_online_report("Reconnected");
     return SATURN_ONLINE_OK;
 }
 
@@ -489,10 +552,24 @@ saturn_online_status_t saturn_online_init(const saturn_online_config_t* config)
         return SATURN_ONLINE_ERR_INVALID_CONFIG;
     }
 
+    /* Reject placeholder dial numbers. Historical default of "0000000"
+     * has fooled more than one new user into thinking their app was
+     * configured correctly when the bridge simply answered *any* dial.
+     * Empty / NULL follow the same fate. Answer mode doesn't dial. */
+    if (config->mode == SATURN_ONLINE_MODE_DIAL) {
+        const char* n = config->dial_number;
+        if (n == 0 || n[0] == '\0' || strcmp(n, "0000000") == 0) {
+            return SATURN_ONLINE_ERR_INVALID_CONFIG;
+        }
+    }
+
     memset(&s_net, 0, sizeof(s_net));
     s_net.config = *config;
     s_net.state = SATURN_ONLINE_STATE_IDLE;
     s_net.initialized = true;
+
+    s_net.dial_timeout_iters =
+        seconds_to_loop_iters(config->dial_timeout_secs);
 
     saturn_online_frame_init(&s_net.rx);
 
@@ -508,26 +585,27 @@ saturn_online_status_t saturn_online_connect(void)
     }
 
     /* Phase 1: Detect modem hardware */
-    set_state(SATURN_ONLINE_STATE_DETECTING, SATURN_ONLINE_OK);
+    saturn_online_set_state(SATURN_ONLINE_STATE_DETECTING, SATURN_ONLINE_OK);
 
     if (!s_net.uart_found) {
         if (!detect_modem()) {
-            set_state(SATURN_ONLINE_STATE_ERROR, SATURN_ONLINE_ERR_NO_MODEM);
+            saturn_online_set_state(SATURN_ONLINE_STATE_ERROR,
+                                     SATURN_ONLINE_ERR_NO_MODEM);
             return SATURN_ONLINE_ERR_NO_MODEM;
         }
     }
 
     /* Phase 2: Probe baud rate and initialize AT settings */
-    set_state(SATURN_ONLINE_STATE_PROBING, SATURN_ONLINE_OK);
+    saturn_online_set_state(SATURN_ONLINE_STATE_PROBING, SATURN_ONLINE_OK);
 
     status = probe_and_init_modem();
     if (status != SATURN_ONLINE_OK) {
-        set_state(SATURN_ONLINE_STATE_ERROR, status);
+        saturn_online_set_state(SATURN_ONLINE_STATE_ERROR, status);
         return status;
     }
 
     /* Phase 3: Establish connection */
-    set_state(SATURN_ONLINE_STATE_CONNECTING, SATURN_ONLINE_OK);
+    saturn_online_set_state(SATURN_ONLINE_STATE_CONNECTING, SATURN_ONLINE_OK);
 
     if (s_net.config.mode == SATURN_ONLINE_MODE_DIAL) {
         status = do_dial();
@@ -536,11 +614,11 @@ saturn_online_status_t saturn_online_connect(void)
     }
 
     if (status != SATURN_ONLINE_OK) {
-        set_state(SATURN_ONLINE_STATE_DISCONNECTED, status);
+        saturn_online_set_state(SATURN_ONLINE_STATE_DISCONNECTED, status);
         return status;
     }
 
-    /* Connected — flush FIFO and enter data mode */
+    /* Connected -- flush FIFO and enter data mode */
     reset_receiver();
     s_net.reconnect_attempts = 0;
 
@@ -548,12 +626,12 @@ saturn_online_status_t saturn_online_connect(void)
     if (s_net.config.use_irq) {
         irq_setup();
         if (s_net.irq_active) {
-            report("IRQ receive enabled");
+            saturn_online_report("IRQ receive enabled");
         }
     }
 
-    set_state(SATURN_ONLINE_STATE_CONNECTED, SATURN_ONLINE_OK);
-    report("Connected");
+    saturn_online_set_state(SATURN_ONLINE_STATE_CONNECTED, SATURN_ONLINE_OK);
+    saturn_online_report("Connected");
 
     return SATURN_ONLINE_OK;
 }
@@ -572,7 +650,7 @@ saturn_online_status_t saturn_online_poll(void)
     {
         if (!check_carrier()) {
             s_net.stats.carrier_losses++;
-            report("Carrier lost");
+            saturn_online_report("Carrier lost");
 
             if (s_net.config.auto_reconnect) {
                 int max = s_net.config.max_reconnect_attempts;
@@ -581,18 +659,18 @@ saturn_online_status_t saturn_online_poll(void)
                     saturn_online_status_t rs = do_reconnect_internal();
                     if (rs == SATURN_ONLINE_OK) {
                         s_net.reconnect_attempts = 0;
-                        set_state(SATURN_ONLINE_STATE_CONNECTED,
-                                   SATURN_ONLINE_OK);
+                        saturn_online_set_state(SATURN_ONLINE_STATE_CONNECTED,
+                                                 SATURN_ONLINE_OK);
                         return SATURN_ONLINE_OK;
                     }
                 }
-                set_state(SATURN_ONLINE_STATE_DISCONNECTED,
-                           SATURN_ONLINE_ERR_CARRIER_LOST);
+                saturn_online_set_state(SATURN_ONLINE_STATE_DISCONNECTED,
+                                         SATURN_ONLINE_ERR_CARRIER_LOST);
                 return SATURN_ONLINE_ERR_CARRIER_LOST;
             }
 
-            set_state(SATURN_ONLINE_STATE_DISCONNECTED,
-                       SATURN_ONLINE_ERR_CARRIER_LOST);
+            saturn_online_set_state(SATURN_ONLINE_STATE_DISCONNECTED,
+                                     SATURN_ONLINE_ERR_CARRIER_LOST);
             return SATURN_ONLINE_ERR_CARRIER_LOST;
         }
     }
@@ -600,7 +678,7 @@ saturn_online_status_t saturn_online_poll(void)
     /* Read bytes and feed to frame receiver.
      *
      * Two paths, same frame processing:
-     *   use_irq=true:  ISR already buffered bytes → drain ring buffer
+     *   use_irq=true:  ISR already buffered bytes -> drain ring buffer
      *   use_irq=false: poll UART registers directly (original behavior)
      */
     if (s_net.state == SATURN_ONLINE_STATE_CONNECTED) {
@@ -680,27 +758,9 @@ saturn_online_status_t saturn_online_send(const uint8_t* payload, uint16_t len)
     return SATURN_ONLINE_OK;
 }
 
-saturn_online_status_t saturn_online_send_raw(const uint8_t* data, uint16_t len)
-{
-    uint16_t i;
-
-    if (s_net.state != SATURN_ONLINE_STATE_CONNECTED) {
-        return SATURN_ONLINE_ERR_NOT_CONNECTED;
-    }
-
-    for (i = 0; i < len; i++) {
-        if (!saturn_uart_putc(&s_net.uart, data[i])) {
-            return SATURN_ONLINE_ERR_SEND_FAILED;
-        }
-    }
-
-    s_net.stats.bytes_sent += len;
-    return SATURN_ONLINE_OK;
-}
-
 saturn_online_status_t saturn_online_disconnect(void)
 {
-    char buf[MODEM_LINE_MAX];
+    char buf[SATURN_ONLINE_MODEM_LINE_MAX];
 
     if (!s_net.initialized) return SATURN_ONLINE_OK;
 
@@ -708,11 +768,11 @@ saturn_online_status_t saturn_online_disconnect(void)
     irq_teardown();
 
     if (s_net.state == SATURN_ONLINE_STATE_CONNECTED) {
-        modem_escape_to_command(&s_net.uart);
-        modem_command(&s_net.uart, "ATH0", buf, sizeof(buf));
+        saturn_online_modem_escape_to_command(&s_net.uart);
+        saturn_online_modem_command(&s_net.uart, "ATH0", buf, sizeof(buf));
     }
 
-    set_state(SATURN_ONLINE_STATE_DISCONNECTED, SATURN_ONLINE_OK);
+    saturn_online_set_state(SATURN_ONLINE_STATE_DISCONNECTED, SATURN_ONLINE_OK);
     return SATURN_ONLINE_OK;
 }
 
@@ -727,7 +787,7 @@ void saturn_online_shutdown(void)
 
     s_net.initialized = false;
     s_net.uart_found = false;
-    set_state(SATURN_ONLINE_STATE_IDLE, SATURN_ONLINE_OK);
+    saturn_online_set_state(SATURN_ONLINE_STATE_IDLE, SATURN_ONLINE_OK);
 }
 
 /*============================================================================
@@ -762,7 +822,6 @@ const char* saturn_online_state_name(saturn_online_state_t state)
     case SATURN_ONLINE_STATE_IDLE:          return "Idle";
     case SATURN_ONLINE_STATE_DETECTING:     return "Detecting";
     case SATURN_ONLINE_STATE_PROBING:       return "Probing";
-    case SATURN_ONLINE_STATE_INITIALIZING:  return "Initializing";
     case SATURN_ONLINE_STATE_CONNECTING:    return "Connecting";
     case SATURN_ONLINE_STATE_CONNECTED:     return "Connected";
     case SATURN_ONLINE_STATE_DISCONNECTED:  return "Disconnected";
@@ -803,7 +862,7 @@ const char* saturn_online_status_name(saturn_online_status_t status)
  * Advanced / Low-Level Access
  *============================================================================*/
 
-const void* saturn_online_get_uart(void)
+const saturn_uart16550_t* saturn_online_get_uart(void)
 {
     if (!s_net.initialized || !s_net.uart_found) return 0;
     return &s_net.uart;
@@ -816,9 +875,9 @@ saturn_online_status_t saturn_online_reconnect(void)
     saturn_online_status_t status = do_reconnect_internal();
     if (status == SATURN_ONLINE_OK) {
         s_net.reconnect_attempts = 0;
-        set_state(SATURN_ONLINE_STATE_CONNECTED, SATURN_ONLINE_OK);
+        saturn_online_set_state(SATURN_ONLINE_STATE_CONNECTED, SATURN_ONLINE_OK);
     } else {
-        set_state(SATURN_ONLINE_STATE_DISCONNECTED, status);
+        saturn_online_set_state(SATURN_ONLINE_STATE_DISCONNECTED, status);
     }
     return status;
 }
@@ -834,6 +893,9 @@ saturn_online_status_t saturn_online_at_command(const char* cmd,
         return SATURN_ONLINE_ERR_NOT_CONNECTED; /* can't AT in data mode */
     }
 
-    modem_result_t r = modem_command(&s_net.uart, cmd, response, buf_len);
-    return (r == MODEM_OK) ? SATURN_ONLINE_OK : SATURN_ONLINE_ERR_NO_RESPONSE;
+    saturn_online_modem_result_t r =
+        saturn_online_modem_command(&s_net.uart, cmd, response, buf_len);
+    return (r == SATURN_ONLINE_MODEM_OK)
+                ? SATURN_ONLINE_OK
+                : SATURN_ONLINE_ERR_NO_RESPONSE;
 }
