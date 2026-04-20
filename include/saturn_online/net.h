@@ -47,18 +47,23 @@
  * The library handles:
  *   - SMPC power-on for the NetLink modem
  *   - Multi-address UART detection (7 known hardware variants)
- *   - Auto-baud modem probing (9600, 19200, 4800, 2400)
+ *   - Auto-baud modem probing (9600, 19200, 4800, 2400) or pinned baud
  *   - AT initialization (ATZ, ATE0, ATX3, ATV1)
  *   - Dial-out or answer-mode connection
  *   - Length-prefixed frame reassembly from UART byte stream
  *   - DCD-based carrier loss detection
  *   - Optional automatic reconnection
+ *   - Optional TX ring buffer (non-blocking sends)
+ *   - Optional heartbeat pings
+ *   - Optional per-poll byte/frame caps
+ *   - Pluggable transport (UART by default, or caller-supplied)
  *   - Connection statistics tracking
  *
  * Dependencies:
- *   - saturn_online/uart.h   (UART driver -- inlined)
- *   - saturn_online/modem.h  (AT command layer -- inlined)
- *   - saturn_online/framing.h (length-prefixed frame reassembly -- inlined)
+ *   - saturn_online/uart.h       (UART driver -- inlined)
+ *   - saturn_online/modem.h      (AT command layer -- inlined)
+ *   - saturn_online/framing.h    (length-prefixed frame reassembly -- inlined)
+ *   - saturn_online/transport.h  (transport abstraction -- optional, forward-declared here)
  *
  * Thread safety: None. Call all functions from the same context (main loop).
  */
@@ -69,10 +74,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Forward declaration -- callers may pass a UART pointer without needing
- * saturn_online/uart.h on their include path. */
+/* Forward declarations -- callers may pass these pointers without
+ * needing the matching headers on their own include path. */
 struct saturn_uart16550;
 typedef struct saturn_uart16550 saturn_uart16550_t;
+
+struct saturn_online_transport;
+typedef struct saturn_online_transport saturn_online_transport_t;
 
 /*============================================================================
  * Connection States
@@ -107,7 +115,9 @@ typedef enum {
     SATURN_ONLINE_ERR_NOT_CONNECTED,   /* Operation requires active connection */
     SATURN_ONLINE_ERR_SEND_FAILED,     /* UART transmit failed (timeout) */
     SATURN_ONLINE_ERR_INVALID_CONFIG,  /* Bad configuration */
-    SATURN_ONLINE_ERR_ALREADY_INIT     /* saturn_online_init() called twice */
+    SATURN_ONLINE_ERR_ALREADY_INIT,    /* saturn_online_init() called twice */
+    SATURN_ONLINE_ERR_WOULDBLOCK,      /* TX buffer full (non-blocking send) */
+    SATURN_ONLINE_ERR_INTERNAL         /* Library invariant violated */
 } saturn_online_status_t;
 
 /*============================================================================
@@ -119,7 +129,10 @@ typedef struct {
     uint32_t bytes_received;        /* Total bytes received from UART */
     uint32_t frames_sent;           /* Frames sent (saturn_online_send calls) */
     uint32_t frames_received;       /* Complete frames received */
-    uint32_t frames_dropped;        /* Frames with invalid length (dropped) */
+    uint32_t rx_frames_dropped;     /* Frames with invalid length (dropped on RX) */
+    uint32_t tx_frames_dropped;     /* Frames dropped because TX buffer was full */
+    uint32_t tx_buffer_peak;        /* High-water mark for TX buffer occupancy */
+    uint32_t heartbeats_sent;       /* Heartbeat frames emitted */
     uint32_t polls;                 /* Number of saturn_online_poll() calls */
     uint32_t carrier_losses;        /* Times DCD dropped */
     uint32_t reconnections;         /* Successful reconnections */
@@ -180,24 +193,20 @@ typedef enum {
 } saturn_online_mode_t;
 
 /**
- * Configuration structure. Initialize with SATURN_ONLINE_DEFAULTS and
- * then override individual fields.
+ * Less-common configuration knobs.
  *
- * Phase 1 keeps the original flat shape aside from renaming
- * `dial_timeout` (loop-iterations) to `dial_timeout_secs` (seconds).
- * Phase 2 will move the less-common knobs into a nested `advanced`
- * struct.
+ * All fields zero-default to the library's baseline behavior
+ * (auto-probe baud, no auto-reconnect, no TX buffer, no heartbeat,
+ * no per-poll caps). Most games leave this struct at zero and set
+ * only the top-level fields.
  */
 typedef struct {
-    /* Connection */
-    const char*           dial_number;       /* Phone number to dial (mode=DIAL) */
-    saturn_online_mode_t  mode;              /* DIAL or ANSWER */
-    uint32_t              dial_timeout_secs; /* Dial/answer timeout in seconds */
-    bool                  auto_reconnect;    /* Reconnect on carrier loss */
-    int                   max_reconnect_attempts; /* 0 = unlimited */
+    /* Reconnect */
+    bool     auto_reconnect;         /* Reconnect on carrier loss */
+    int      max_reconnect_attempts; /* 0 = unlimited */
 
     /* DCD monitoring */
-    bool                  monitor_dcd;    /* Check DCD each poll (default: true) */
+    bool     monitor_dcd;            /* Check DCD each poll (library default: true) */
 
     /* Interrupt-driven receive (opt-in, default: false = polling)
      *
@@ -206,22 +215,59 @@ typedef struct {
      * saturn_online_poll() then reads from the ring buffer instead of polling
      * the UART directly.
      *
-     * Benefits: no dropped bytes during long renders or VDP operations.
-     * Requires: Saturn hardware (silently ignored on non-Saturn builds).
-     *
-     * When false (default), saturn_online_poll() polls the UART directly.
-     * This is the original behavior and always works. */
-    bool                  use_irq;
+     * Requires: Saturn hardware (silently ignored on non-Saturn builds). */
+    bool     use_irq;
 
-    /* Frame processing */
-    int                   max_bytes_per_poll; /* Max UART bytes to read per poll
-                                                (0 = unlimited, drain FIFO) */
+    /* Per-poll caps */
+    uint16_t max_bytes_per_poll;     /* Max bytes drained per poll (0 = unlimited) */
+    uint16_t max_frames_per_poll;    /* Max frames delivered per poll (0 = unlimited) */
 
-    /* Callbacks (all optional except on_frame) */
+    /* Baud control. 0 = auto-probe at standard rates;
+     * nonzero = pinned baud (use the SATURN_ONLINE_MODEM_BAUD_* divisors). */
+    uint16_t fixed_baud_divisor;
+
+    /* Heartbeat. When nonzero the library emits a single-byte ping
+     * frame (payload 0x00) every N poll-seconds, and signals a
+     * SATURN_ONLINE_ERR_TIMEOUT if no RX bytes arrive for 2*N seconds.
+     * Units are "seconds at 60 Hz poll"; scale to your poll rate. */
+    uint32_t heartbeat_secs;
+
+    /* TX buffering. 0 = synchronous UART writes (legacy behavior).
+     * Nonzero = library copies sends into a ring buffer (up to
+     * SATURN_ONLINE_TX_BUFFER_MAX) and drains on poll. Sends that
+     * don't fit return SATURN_ONLINE_ERR_WOULDBLOCK. */
+    uint32_t tx_buffer_size;
+} saturn_online_advanced_t;
+
+/**
+ * Top-level configuration structure.
+ *
+ * Initialize with SATURN_ONLINE_DEFAULTS and then override individual
+ * fields. The nested `advanced` block zero-initializes to the library's
+ * default behavior.
+ */
+typedef struct {
+    /* Connection */
+    const char*           dial_number;       /* Phone number to dial (mode=DIAL) */
+    saturn_online_mode_t  mode;              /* DIAL or ANSWER */
+    uint32_t              dial_timeout_secs; /* Dial/answer timeout in seconds */
+
+    /* Callbacks (on_frame is required) */
     saturn_online_frame_fn   on_frame;     /* REQUIRED: complete frame received */
     saturn_online_state_fn   on_state;     /* Connection state changed */
     saturn_online_status_fn  on_status;    /* Status message for display */
     void*                    user;         /* Context pointer for callbacks */
+
+    /* Optional transport override. NULL = default UART transport (detect,
+     * probe, dial). Non-NULL = the library skips modem setup and talks
+     * to the supplied transport as if already connected. Useful for
+     * emulator-over-TCP, DreamPi-over-UDP, captured-file replay, or
+     * CI tests that want to swap the link layer without touching the
+     * rest of the library. */
+    const saturn_online_transport_t* transport;
+
+    /* Less-common knobs (zero-default). */
+    saturn_online_advanced_t advanced;
 } saturn_online_config_t;
 
 /**
@@ -230,21 +276,29 @@ typedef struct {
  *
  * `dial_number` intentionally left NULL so saturn_online_init() rejects
  * unconfigured callers with SATURN_ONLINE_ERR_INVALID_CONFIG. Every
- * caller must supply a real dial number (e.g. "#555#") before init.
+ * caller must supply a real dial number (e.g. "#555#") before init
+ * (unless they also supply a transport override, which bypasses dial).
  */
 #define SATURN_ONLINE_DEFAULTS { \
-    .dial_number            = 0,                   \
-    .mode                   = SATURN_ONLINE_MODE_DIAL, \
-    .dial_timeout_secs      = 60,                  \
-    .auto_reconnect         = false,               \
-    .max_reconnect_attempts = 3,                   \
-    .monitor_dcd            = true,                \
-    .use_irq                = false,               \
-    .max_bytes_per_poll     = 0,                   \
-    .on_frame               = 0,                   \
-    .on_state               = 0,                   \
-    .on_status              = 0,                   \
-    .user                   = 0                    \
+    .dial_number       = 0,                       \
+    .mode              = SATURN_ONLINE_MODE_DIAL, \
+    .dial_timeout_secs = 60,                      \
+    .on_frame          = 0,                       \
+    .on_state          = 0,                       \
+    .on_status         = 0,                       \
+    .user              = 0,                       \
+    .transport         = 0,                       \
+    .advanced = {                                 \
+        .auto_reconnect         = false,          \
+        .max_reconnect_attempts = 3,              \
+        .monitor_dcd            = true,           \
+        .use_irq                = false,          \
+        .max_bytes_per_poll     = 0,              \
+        .max_frames_per_poll    = 0,              \
+        .fixed_baud_divisor     = 0,              \
+        .heartbeat_secs         = 0,              \
+        .tx_buffer_size         = 0,              \
+    }                                             \
 }
 
 /*============================================================================

@@ -15,6 +15,7 @@
 #include "saturn_online/uart.h"
 #include "saturn_online/modem.h"
 #include "saturn_online/framing.h"
+#include "saturn_online/transport.h"
 #include "saturn_online_internal.h"
 
 #include <string.h>
@@ -43,7 +44,7 @@ static const struct {
     (int)(sizeof(s_modem_addrs) / sizeof(s_modem_addrs[0]))
 
 /*============================================================================
- * Interrupt-Driven RX -- Ring Buffer
+ * Interrupt-Driven RX -- Ring Buffer (RX path)
  *
  * Single-producer (ISR writes head) / single-consumer (poll reads tail).
  * Power-of-2 size for fast index masking. No lock needed.
@@ -51,8 +52,8 @@ static const struct {
  * At 9600 baud (960 bytes/sec) and 60 fps, ~16 bytes arrive per frame.
  * A 512-byte buffer gives ~32 frames of headroom before overflow.
  *
- * The struct type lives in saturn_online_internal.h so other TUs
- * (Phase 3's connect_async.c) can inspect state through the shared
+ * Struct type lives in saturn_online_internal.h so other TUs
+ * (connect_async.c, matchmaking.c) can inspect state through the shared
  * singleton.
  *============================================================================*/
 
@@ -89,6 +90,49 @@ static inline uint8_t ringbuf_get(saturn_online_ringbuf_t* rb) {
     uint8_t byte = rb->buf[rb->tail];
     rb->tail = (rb->tail + 1) & SATURN_ONLINE_RINGBUF_MASK;
     return byte;
+}
+
+/*============================================================================
+ * TX Ring Buffer (optional, main-loop only)
+ *
+ * When advanced.tx_buffer_size > 0, saturn_online_send() copies into a
+ * heap-free fixed buffer (SATURN_ONLINE_TX_BUFFER_MAX bytes cap) and
+ * returns immediately. saturn_online_poll() drains the buffer as UART
+ * TX is ready. Both producer and consumer run on the main loop -- no
+ * concurrency concerns.
+ *
+ * Struct type lives in saturn_online_internal.h.
+ *============================================================================*/
+
+static void txbuf_reset(saturn_online_txbuf_t* tb) {
+    tb->head = tb->tail = tb->count = 0;
+}
+
+static uint32_t txbuf_free(const saturn_online_txbuf_t* tb) {
+    return tb->cap - tb->count;
+}
+
+static bool txbuf_push(saturn_online_txbuf_t* tb, const uint8_t* data,
+                        uint32_t len) {
+    if (len > txbuf_free(tb)) return false;
+    for (uint32_t i = 0; i < len; i++) {
+        tb->buf[tb->head] = data[i];
+        tb->head = (tb->head + 1) % tb->cap;
+    }
+    tb->count += len;
+    return true;
+}
+
+static bool txbuf_peek(const saturn_online_txbuf_t* tb, uint8_t* out) {
+    if (tb->count == 0) return false;
+    *out = tb->buf[tb->tail];
+    return true;
+}
+
+static void txbuf_pop(saturn_online_txbuf_t* tb) {
+    if (tb->count == 0) return;
+    tb->tail = (tb->tail + 1) % tb->cap;
+    tb->count--;
 }
 
 /*============================================================================
@@ -134,82 +178,37 @@ int saturn_online_last_modem_response(char* buf, int len) {
 /*============================================================================
  * Wall-clock timeout conversion
  *
- * The public API uses seconds for timeouts; the underlying AT busy loops
- * use opaque "loop iterations". The reference build is calibrated so
- * ~3,000,000 iterations per second produces the familiar 60 s / 180M-iter
- * behavior. Emulator speed and cache state can drift this number in
- * either direction; that drift was present before seconds was exposed
- * and is documented as "approximate".
- *
- * A later refinement can read the SH-2 Free-Running Timer (FRT, registers
- * 0xFFFFFE12/0xFFFFFE13) to calibrate at init time. The deliberate
- * simplification here is that FRT clock dividers can be changed by the
- * game after init, which would invalidate a cached calibration. Sticking
- * with the classic busy-wait heuristic keeps the library's behavior
- * identical to the pre-Phase-1 baseline when the game hasn't asked for
- * anything unusual.
+ * See Phase 1 commit message for rationale; this remains a calibrated
+ * busy-wait heuristic rather than an FRT-based measurement because FRT
+ * clock dividers can be changed by the game after init and invalidate
+ * any cached calibration.
  *============================================================================*/
 
 static uint32_t seconds_to_loop_iters(uint32_t secs) {
-    /* Reference: 60 s  ->  180,000,000 iters */
     const uint32_t iters_per_sec = 3000000UL;
     if (secs == 0) secs = 1;
-    if (secs > 600) secs = 600;  /* hard cap at 10 minutes */
+    if (secs > 600) secs = 600;
     return secs * iters_per_sec;
 }
 
 /*============================================================================
  * Interrupt-Driven RX -- Saturn Hardware Setup
- *
- * The NetLink UART fires SCU External Interrupt 12 (vector 0x5C).
- * The ISR drains the UART FIFO into the ring buffer. The main-loop
- * poll() then reads from the ring buffer instead of touching the UART.
- *
- * This entire section compiles to nothing on non-Saturn builds.
- * When use_irq is false, none of these functions are called.
  *============================================================================*/
 
 #if defined(__SATURN__)
 
-/*
- * SCU registers for interrupt control.
- *
- * IMS (Interrupt Mask Set): writing a full 32-bit mask value.
- *   Bit 0  = V-blank IN  ...  Bit 15 = reserved
- *   Bits 16-31 = External Interrupts 0-15
- *   A '1' bit means the interrupt is MASKED (disabled).
- *
- * IST (Interrupt Status): read for pending, write to acknowledge.
- *
- * External Interrupt 12 = bit 28 (16 + 12).
- */
 #define SCU_REG_IMS    (*(volatile uint32_t*)0x25FE00A0)
 #define SCU_REG_IST    (*(volatile uint32_t*)0x25FE00A4)
-
 #define SCU_EXTINT12_BIT  (1u << 28)
-
-/* UART interrupt vector number */
 #define SATURN_ONLINE_IRQ_VECTOR  0x5C
-
-/* IER bit 0: Receive Data Available interrupt */
 #define SATURN_UART_IER_RDA  0x01
 
-/**
- * Read the SH-2 Vector Base Register.
- */
 static inline uint32_t sh2_get_vbr(void) {
     uint32_t vbr;
     __asm__ volatile("stc vbr, %0" : "=r"(vbr));
     return vbr;
 }
 
-/**
- * UART receive ISR.
- *
- * Drains all available bytes from the 16550 FIFO into the ring buffer.
- * Marked interrupt_handler so GCC generates proper SH-2 exception
- * prologue/epilogue (save regs, use RTE instead of RTS).
- */
 static void __attribute__((interrupt_handler)) saturn_online_uart_isr(void)
 {
     while (saturn_uart_rx_ready(&s_net.uart)) {
@@ -219,43 +218,29 @@ static void __attribute__((interrupt_handler)) saturn_online_uart_isr(void)
             s_net.stats.irq_overflows++;
         }
     }
-
-    /* Acknowledge the SCU interrupt */
     SCU_REG_IST = SCU_EXTINT12_BIT;
 }
 
-/**
- * Install the UART ISR and enable the interrupt path.
- */
 static void irq_setup(void)
 {
     uint32_t vbr = sh2_get_vbr();
     volatile uint32_t* vtable = (volatile uint32_t*)vbr;
     uint32_t mask;
 
-    /* Save previous vector for cleanup */
     s_net.saved_vector = vtable[SATURN_ONLINE_IRQ_VECTOR];
-
-    /* Install our ISR */
     vtable[SATURN_ONLINE_IRQ_VECTOR] = (uint32_t)saturn_online_uart_isr;
 
-    /* Reset ring buffer */
     ringbuf_reset(&s_net.ringbuf);
 
-    /* Unmask External Interrupt 12 in SCU (clear bit 28) */
     mask = SCU_REG_IMS;
     mask &= ~SCU_EXTINT12_BIT;
     SCU_REG_IMS = mask;
 
-    /* Enable UART Receive Data Available interrupt */
     saturn_uart_reg_write(&s_net.uart, SATURN_UART_IER, SATURN_UART_IER_RDA);
 
     s_net.irq_active = true;
 }
 
-/**
- * Disable the UART interrupt and restore the previous vector.
- */
 static void irq_teardown(void)
 {
     uint32_t vbr;
@@ -264,15 +249,12 @@ static void irq_teardown(void)
 
     if (!s_net.irq_active) return;
 
-    /* Disable UART receive interrupt */
     saturn_uart_reg_write(&s_net.uart, SATURN_UART_IER, 0x00);
 
-    /* Re-mask External Interrupt 12 in SCU (set bit 28) */
     mask = SCU_REG_IMS;
     mask |= SCU_EXTINT12_BIT;
     SCU_REG_IMS = mask;
 
-    /* Restore previous vector */
     vbr = sh2_get_vbr();
     vtable = (volatile uint32_t*)vbr;
     vtable[SATURN_ONLINE_IRQ_VECTOR] = s_net.saved_vector;
@@ -282,17 +264,15 @@ static void irq_teardown(void)
 
 #else /* !__SATURN__ */
 
-/* Non-Saturn builds: IRQ is silently unavailable. */
 static void irq_setup(void)    { s_net.irq_active = false; }
 static void irq_teardown(void) { }
 
 #endif /* __SATURN__ */
 
 /*============================================================================
- * Internal Helpers
+ * Shared helpers (exposed to other TUs)
  *============================================================================*/
 
-/** Transition to a new state, firing the callback. */
 void saturn_online_set_state(saturn_online_state_t new_state,
                               saturn_online_status_t status)
 {
@@ -304,7 +284,6 @@ void saturn_online_set_state(saturn_online_state_t new_state,
     }
 }
 
-/** Report a status message to the user. */
 void saturn_online_report(const char* msg)
 {
     if (s_net.config.on_status) {
@@ -312,13 +291,10 @@ void saturn_online_report(const char* msg)
     }
 }
 
-/**
- * Detect modem hardware by scanning all known UART addresses.
- * Sets s_net.uart on success.
- *
- * Uses a two-pass approach: first with normal SMPC settle time,
- * then with an extended settle for slower modem controllers.
- */
+/*============================================================================
+ * Modem / connect internals
+ *============================================================================*/
+
 static bool detect_modem(void)
 {
     int pass, i;
@@ -347,7 +323,6 @@ static bool detect_modem(void)
                 return true;
             }
 
-            /* SCR test failed but LSR looks live -- try AT probe */
             if (r.lsr != 0xFF && r.lsr != 0x00 &&
                 (r.lsr & (SATURN_UART_LSR_THRE | SATURN_UART_LSR_TEMT))) {
                 s_net.uart = probe;
@@ -360,18 +335,23 @@ static bool detect_modem(void)
             }
         }
     }
-
     return false;
 }
 
-/**
- * Probe modem baud rate and initialize AT settings.
- */
 static saturn_online_status_t probe_and_init_modem(void)
 {
+    saturn_online_modem_result_t probe_result;
+
     saturn_online_report("Probing modem...");
 
-    if (saturn_online_modem_probe(&s_net.uart) != SATURN_ONLINE_MODEM_OK) {
+    if (s_net.config.advanced.fixed_baud_divisor != 0) {
+        probe_result = saturn_online_modem_probe_fixed(
+            &s_net.uart, s_net.config.advanced.fixed_baud_divisor);
+    } else {
+        probe_result = saturn_online_modem_probe(&s_net.uart);
+    }
+
+    if (probe_result != SATURN_ONLINE_MODEM_OK) {
         saturn_online_report("No modem response");
         return SATURN_ONLINE_ERR_NO_RESPONSE;
     }
@@ -388,9 +368,6 @@ static saturn_online_status_t probe_and_init_modem(void)
     return SATURN_ONLINE_OK;
 }
 
-/**
- * Dial out to the configured number.
- */
 static saturn_online_status_t do_dial(void)
 {
     saturn_online_modem_result_t result;
@@ -404,30 +381,15 @@ static saturn_online_status_t do_dial(void)
     case SATURN_ONLINE_MODEM_CONNECT:
         saturn_online_modem_flush_input(&s_net.uart);
         return SATURN_ONLINE_OK;
-    case SATURN_ONLINE_MODEM_NO_CARRIER:
-        saturn_online_report("No carrier");
-        return SATURN_ONLINE_ERR_NO_CARRIER;
-    case SATURN_ONLINE_MODEM_BUSY:
-        saturn_online_report("Busy");
-        return SATURN_ONLINE_ERR_BUSY;
-    case SATURN_ONLINE_MODEM_NO_DIALTONE:
-        saturn_online_report("No dial tone");
-        return SATURN_ONLINE_ERR_NO_DIALTONE;
-    case SATURN_ONLINE_MODEM_NO_ANSWER:
-        saturn_online_report("No answer");
-        return SATURN_ONLINE_ERR_NO_ANSWER;
-    case SATURN_ONLINE_MODEM_TIMEOUT_ERR:
-        saturn_online_report("Dial timeout");
-        return SATURN_ONLINE_ERR_TIMEOUT;
-    default:
-        saturn_online_report("Dial failed");
-        return SATURN_ONLINE_ERR_NO_CARRIER;
+    case SATURN_ONLINE_MODEM_NO_CARRIER:  saturn_online_report("No carrier"); return SATURN_ONLINE_ERR_NO_CARRIER;
+    case SATURN_ONLINE_MODEM_BUSY:        saturn_online_report("Busy");       return SATURN_ONLINE_ERR_BUSY;
+    case SATURN_ONLINE_MODEM_NO_DIALTONE: saturn_online_report("No dial tone"); return SATURN_ONLINE_ERR_NO_DIALTONE;
+    case SATURN_ONLINE_MODEM_NO_ANSWER:   saturn_online_report("No answer");  return SATURN_ONLINE_ERR_NO_ANSWER;
+    case SATURN_ONLINE_MODEM_TIMEOUT_ERR: saturn_online_report("Dial timeout"); return SATURN_ONLINE_ERR_TIMEOUT;
+    default:                              saturn_online_report("Dial failed"); return SATURN_ONLINE_ERR_NO_CARRIER;
     }
 }
 
-/**
- * Wait for an incoming call (answer mode).
- */
 static saturn_online_status_t do_answer(void)
 {
     char buf[SATURN_ONLINE_MODEM_LINE_MAX];
@@ -435,7 +397,6 @@ static saturn_online_status_t do_answer(void)
 
     saturn_online_report("Waiting for call...");
 
-    /* Enable auto-answer */
     result = saturn_online_modem_command_timeout(
         &s_net.uart, "ATS0=1", buf, sizeof(buf), s_net.dial_timeout_iters);
     if (result != SATURN_ONLINE_MODEM_OK) {
@@ -443,7 +404,6 @@ static saturn_online_status_t do_answer(void)
         return SATURN_ONLINE_ERR_INIT_FAILED;
     }
 
-    /* Wait for CONNECT */
     while (1) {
         int len = saturn_online_modem_read_line(
             &s_net.uart, buf, sizeof(buf), s_net.dial_timeout_iters);
@@ -464,50 +424,47 @@ static saturn_online_status_t do_answer(void)
             saturn_online_report("Answer failed");
             return SATURN_ONLINE_ERR_NO_CARRIER;
         }
-        /* RING or other -- keep waiting */
     }
 }
 
-/**
- * Flush UART FIFO and reset the frame receiver.
- * Also resets the ring buffer when in IRQ mode.
- */
 static void reset_receiver(void)
 {
-    saturn_uart_reg_write(&s_net.uart, SATURN_UART_FCR,
-        SATURN_UART_FCR_ENABLE | SATURN_UART_FCR_RXRESET);
+    if (!s_net.transport) {
+        saturn_uart_reg_write(&s_net.uart, SATURN_UART_FCR,
+            SATURN_UART_FCR_ENABLE | SATURN_UART_FCR_RXRESET);
+    }
     saturn_online_frame_init(&s_net.rx);
     ringbuf_reset(&s_net.ringbuf);
+    txbuf_reset(&s_net.txbuf);
+    s_net.heartbeat_ticks_remaining = s_net.heartbeat_ticks_period;
+    s_net.heartbeat_rx_watchdog =
+        s_net.heartbeat_ticks_period ? (s_net.heartbeat_ticks_period * 2) : 0;
 }
 
-/**
- * Check DCD line to detect carrier loss.
- */
 static bool check_carrier(void)
 {
+    if (s_net.transport) {
+        return saturn_online_transport_is_connected(s_net.transport);
+    }
     uint8_t msr = saturn_uart_reg_read(&s_net.uart, SATURN_UART_MSR);
     return (msr & SATURN_UART_MSR_DCD) != 0;
 }
 
-/**
- * Full reconnect sequence: escape-to-command, hangup, re-probe, re-init,
- * re-dial.
- */
 static saturn_online_status_t do_reconnect_internal(void)
 {
     char buf[SATURN_ONLINE_MODEM_LINE_MAX];
     saturn_online_status_t status;
 
+    /* Transport-driven sessions don't support full reconnect (we don't
+     * know how to re-open the underlying transport). Surface a clear
+     * error to the caller. */
+    if (s_net.transport) return SATURN_ONLINE_ERR_INVALID_CONFIG;
+
     saturn_online_set_state(SATURN_ONLINE_STATE_RECONNECTING,
                              SATURN_ONLINE_ERR_CARRIER_LOST);
 
-    /* Disable IRQ during AT command mode */
     irq_teardown();
 
-    /* Escape-to-command BEFORE the hangup AT command. If the modem is
-     * still in data mode after a carrier dropout, sending ATH0 without
-     * escaping first will be consumed as payload and hang the AT
-     * exchange. Matches saturn_online_disconnect(). */
     saturn_online_report("Escape to command...");
     saturn_online_modem_escape_to_command(&s_net.uart);
 
@@ -523,13 +480,11 @@ static saturn_online_status_t do_reconnect_internal(void)
     } else {
         status = do_answer();
     }
-
     if (status != SATURN_ONLINE_OK) return status;
 
     reset_receiver();
 
-    /* Re-enable IRQ after reconnection */
-    if (s_net.config.use_irq) {
+    if (s_net.config.advanced.use_irq) {
         irq_setup();
     }
 
@@ -539,7 +494,88 @@ static saturn_online_status_t do_reconnect_internal(void)
 }
 
 /*============================================================================
- * Public API
+ * TX paths
+ *
+ * Centralizes the "send N bytes" operation so saturn_online_send,
+ * the async connect path (Phase 3), and the heartbeat emitter can
+ * share the same TX-buffer vs. direct-write choice.
+ *============================================================================*/
+
+static bool direct_putc(uint8_t byte)
+{
+    if (s_net.transport) {
+        uint8_t b = byte;
+        return saturn_online_transport_send(s_net.transport, &b, 1) == 1;
+    }
+    return saturn_uart_putc(&s_net.uart, byte);
+}
+
+static bool tx_write_direct(const uint8_t* data, uint16_t len)
+{
+    for (uint16_t i = 0; i < len; i++) {
+        if (!direct_putc(data[i])) return false;
+    }
+    return true;
+}
+
+static bool tx_enqueue(const uint8_t* data, uint32_t len)
+{
+    if (!txbuf_push(&s_net.txbuf, data, len)) return false;
+    if (s_net.txbuf.count > s_net.stats.tx_buffer_peak) {
+        s_net.stats.tx_buffer_peak = s_net.txbuf.count;
+    }
+    return true;
+}
+
+static void tx_drain(void)
+{
+    if (!s_net.txbuf_enabled) return;
+
+    uint8_t byte;
+    while (txbuf_peek(&s_net.txbuf, &byte)) {
+        if (s_net.transport) {
+            int sent = saturn_online_transport_send(s_net.transport, &byte, 1);
+            if (sent != 1) return;
+        } else {
+            if (!saturn_uart_tx_ready(&s_net.uart)) return;
+            if (!saturn_uart_putc(&s_net.uart, byte)) return;
+        }
+        txbuf_pop(&s_net.txbuf);
+    }
+}
+
+/*============================================================================
+ * Heartbeat
+ *
+ * Emits a single-byte frame (payload 0x00) at the configured interval.
+ * The emitter is driven from poll(), so it runs at the game's poll rate;
+ * heartbeat_secs is interpreted as "seconds at 60 Hz poll".
+ *============================================================================*/
+
+static void heartbeat_emit(void)
+{
+    /* [LEN_HI=0][LEN_LO=1][payload=0x00] */
+    uint8_t wire[3] = { 0x00, 0x01, 0x00 };
+
+    if (s_net.txbuf_enabled) {
+        if (txbuf_free(&s_net.txbuf) >= 3 && tx_enqueue(wire, 3)) {
+            s_net.stats.bytes_sent += 3;
+            s_net.stats.frames_sent++;
+            s_net.stats.heartbeats_sent++;
+        } else {
+            s_net.stats.tx_frames_dropped++;
+        }
+    } else {
+        if (tx_write_direct(wire, 3)) {
+            s_net.stats.bytes_sent += 3;
+            s_net.stats.frames_sent++;
+            s_net.stats.heartbeats_sent++;
+        }
+    }
+}
+
+/*============================================================================
+ * Public API -- Init / Connect
  *============================================================================*/
 
 saturn_online_status_t saturn_online_init(const saturn_online_config_t* config)
@@ -552,27 +588,52 @@ saturn_online_status_t saturn_online_init(const saturn_online_config_t* config)
         return SATURN_ONLINE_ERR_INVALID_CONFIG;
     }
 
-    /* Reject placeholder dial numbers. Historical default of "0000000"
-     * has fooled more than one new user into thinking their app was
-     * configured correctly when the bridge simply answered *any* dial.
-     * Empty / NULL follow the same fate. Answer mode doesn't dial. */
-    if (config->mode == SATURN_ONLINE_MODE_DIAL) {
+    /* Reject placeholder dial_number when using the default UART
+     * transport and dial mode. Transport override skips dial entirely,
+     * as does answer mode. */
+    if (!config->transport && config->mode == SATURN_ONLINE_MODE_DIAL) {
         const char* n = config->dial_number;
         if (n == 0 || n[0] == '\0' || strcmp(n, "0000000") == 0) {
             return SATURN_ONLINE_ERR_INVALID_CONFIG;
         }
     }
 
+    uint32_t tx_cap = config->advanced.tx_buffer_size;
+    if (tx_cap > SATURN_ONLINE_TX_BUFFER_MAX) {
+        tx_cap = SATURN_ONLINE_TX_BUFFER_MAX;
+    }
+
     memset(&s_net, 0, sizeof(s_net));
     s_net.config = *config;
     s_net.state = SATURN_ONLINE_STATE_IDLE;
     s_net.initialized = true;
+    s_net.transport = config->transport;
 
     s_net.dial_timeout_iters =
         seconds_to_loop_iters(config->dial_timeout_secs);
 
+    s_net.txbuf_enabled = (tx_cap > 0);
+    s_net.txbuf.cap = tx_cap ? tx_cap : 1;  /* avoid div-by-zero */
+
+    /* Heartbeat tick period measured in poll() invocations. Games that
+     * poll at 60 Hz get actual seconds; off-rate callers scale to
+     * their own poll frequency. */
+    s_net.heartbeat_ticks_period = config->advanced.heartbeat_secs * 60;
+    s_net.heartbeat_ticks_remaining = s_net.heartbeat_ticks_period;
+    s_net.heartbeat_rx_watchdog =
+        s_net.heartbeat_ticks_period ? (s_net.heartbeat_ticks_period * 2) : 0;
+
     saturn_online_frame_init(&s_net.rx);
 
+    return SATURN_ONLINE_OK;
+}
+
+static saturn_online_status_t connect_via_transport(void)
+{
+    reset_receiver();
+    s_net.reconnect_attempts = 0;
+    saturn_online_set_state(SATURN_ONLINE_STATE_CONNECTED, SATURN_ONLINE_OK);
+    saturn_online_report("Connected via transport");
     return SATURN_ONLINE_OK;
 }
 
@@ -584,7 +645,10 @@ saturn_online_status_t saturn_online_connect(void)
         return SATURN_ONLINE_ERR_INVALID_CONFIG;
     }
 
-    /* Phase 1: Detect modem hardware */
+    if (s_net.transport) {
+        return connect_via_transport();
+    }
+
     saturn_online_set_state(SATURN_ONLINE_STATE_DETECTING, SATURN_ONLINE_OK);
 
     if (!s_net.uart_found) {
@@ -595,7 +659,6 @@ saturn_online_status_t saturn_online_connect(void)
         }
     }
 
-    /* Phase 2: Probe baud rate and initialize AT settings */
     saturn_online_set_state(SATURN_ONLINE_STATE_PROBING, SATURN_ONLINE_OK);
 
     status = probe_and_init_modem();
@@ -604,7 +667,6 @@ saturn_online_status_t saturn_online_connect(void)
         return status;
     }
 
-    /* Phase 3: Establish connection */
     saturn_online_set_state(SATURN_ONLINE_STATE_CONNECTING, SATURN_ONLINE_OK);
 
     if (s_net.config.mode == SATURN_ONLINE_MODE_DIAL) {
@@ -618,12 +680,10 @@ saturn_online_status_t saturn_online_connect(void)
         return status;
     }
 
-    /* Connected -- flush FIFO and enter data mode */
     reset_receiver();
     s_net.reconnect_attempts = 0;
 
-    /* Enable interrupt-driven RX if requested */
-    if (s_net.config.use_irq) {
+    if (s_net.config.advanced.use_irq) {
         irq_setup();
         if (s_net.irq_active) {
             saturn_online_report("IRQ receive enabled");
@@ -636,24 +696,32 @@ saturn_online_status_t saturn_online_connect(void)
     return SATURN_ONLINE_OK;
 }
 
+/*============================================================================
+ * Public API -- Poll / Send
+ *============================================================================*/
+
 saturn_online_status_t saturn_online_poll(void)
 {
     int bytes_read = 0;
+    uint16_t frames_read = 0;
 
     if (!s_net.initialized) return SATURN_ONLINE_OK;
 
     s_net.stats.polls++;
 
+    /* Drain any pending TX before other work. */
+    if (s_net.txbuf_enabled) tx_drain();
+
     /* Check connection health */
     if (s_net.state == SATURN_ONLINE_STATE_CONNECTED &&
-        s_net.config.monitor_dcd)
+        s_net.config.advanced.monitor_dcd)
     {
         if (!check_carrier()) {
             s_net.stats.carrier_losses++;
             saturn_online_report("Carrier lost");
 
-            if (s_net.config.auto_reconnect) {
-                int max = s_net.config.max_reconnect_attempts;
+            if (s_net.config.advanced.auto_reconnect && !s_net.transport) {
+                int max = s_net.config.advanced.max_reconnect_attempts;
                 if (max == 0 || s_net.reconnect_attempts < max) {
                     s_net.reconnect_attempts++;
                     saturn_online_status_t rs = do_reconnect_internal();
@@ -677,15 +745,33 @@ saturn_online_status_t saturn_online_poll(void)
 
     /* Read bytes and feed to frame receiver.
      *
-     * Two paths, same frame processing:
-     *   use_irq=true:  ISR already buffered bytes -> drain ring buffer
-     *   use_irq=false: poll UART registers directly (original behavior)
+     * Three paths, same frame processing:
+     *   transport override: read from the caller-supplied transport.
+     *   use_irq=true:       ISR already buffered bytes -> drain ring buffer.
+     *   use_irq=false:      poll UART registers directly (original behavior).
      */
     if (s_net.state == SATURN_ONLINE_STATE_CONNECTED) {
-        int limit = s_net.config.max_bytes_per_poll;
+        uint16_t byte_limit  = s_net.config.advanced.max_bytes_per_poll;
+        uint16_t frame_limit = s_net.config.advanced.max_frames_per_poll;
 
-        if (s_net.irq_active) {
-            /* IRQ path: read from ring buffer (filled by ISR) */
+        if (s_net.transport) {
+            while (saturn_online_transport_rx_ready(s_net.transport)) {
+                uint8_t byte = saturn_online_transport_rx_byte(s_net.transport);
+                s_net.stats.bytes_received++;
+                bytes_read++;
+
+                if (saturn_online_frame_feed(&s_net.rx, byte)) {
+                    s_net.stats.frames_received++;
+                    frames_read++;
+                    s_net.config.on_frame(s_net.rx.buf,
+                                           s_net.rx.payload_len,
+                                           s_net.config.user);
+                    if (frame_limit > 0 && frames_read >= frame_limit) break;
+                }
+
+                if (byte_limit > 0 && bytes_read >= byte_limit) break;
+            }
+        } else if (s_net.irq_active) {
             while (!ringbuf_empty(&s_net.ringbuf)) {
                 uint8_t byte = ringbuf_get(&s_net.ringbuf);
                 s_net.stats.bytes_received++;
@@ -693,15 +779,16 @@ saturn_online_status_t saturn_online_poll(void)
 
                 if (saturn_online_frame_feed(&s_net.rx, byte)) {
                     s_net.stats.frames_received++;
+                    frames_read++;
                     s_net.config.on_frame(s_net.rx.buf,
                                            s_net.rx.payload_len,
                                            s_net.config.user);
+                    if (frame_limit > 0 && frames_read >= frame_limit) break;
                 }
 
-                if (limit > 0 && bytes_read >= limit) break;
+                if (byte_limit > 0 && bytes_read >= byte_limit) break;
             }
         } else {
-            /* Polling path: read UART directly (default, unchanged) */
             while (saturn_uart_rx_ready(&s_net.uart)) {
                 uint8_t byte = (uint8_t)saturn_uart_reg_read(&s_net.uart,
                                                               SATURN_UART_RBR);
@@ -710,12 +797,36 @@ saturn_online_status_t saturn_online_poll(void)
 
                 if (saturn_online_frame_feed(&s_net.rx, byte)) {
                     s_net.stats.frames_received++;
+                    frames_read++;
                     s_net.config.on_frame(s_net.rx.buf,
                                            s_net.rx.payload_len,
                                            s_net.config.user);
+                    if (frame_limit > 0 && frames_read >= frame_limit) break;
                 }
 
-                if (limit > 0 && bytes_read >= limit) break;
+                if (byte_limit > 0 && bytes_read >= byte_limit) break;
+            }
+        }
+
+        /* Heartbeat book-keeping. */
+        if (s_net.heartbeat_ticks_period != 0) {
+            if (bytes_read > 0) {
+                s_net.heartbeat_rx_watchdog = s_net.heartbeat_ticks_period * 2;
+            } else if (s_net.heartbeat_rx_watchdog > 0) {
+                if (--s_net.heartbeat_rx_watchdog == 0) {
+                    saturn_online_report("Heartbeat watchdog");
+                    saturn_online_set_state(SATURN_ONLINE_STATE_DISCONNECTED,
+                                             SATURN_ONLINE_ERR_TIMEOUT);
+                    return SATURN_ONLINE_ERR_TIMEOUT;
+                }
+            }
+
+            if (s_net.heartbeat_ticks_remaining > 0) {
+                if (--s_net.heartbeat_ticks_remaining == 0) {
+                    heartbeat_emit();
+                    s_net.heartbeat_ticks_remaining =
+                        s_net.heartbeat_ticks_period;
+                }
             }
         }
 
@@ -727,8 +838,6 @@ saturn_online_status_t saturn_online_poll(void)
 
 saturn_online_status_t saturn_online_send(const uint8_t* payload, uint16_t len)
 {
-    uint16_t i;
-
     if (s_net.state != SATURN_ONLINE_STATE_CONNECTED) {
         return SATURN_ONLINE_ERR_NOT_CONNECTED;
     }
@@ -737,19 +846,28 @@ saturn_online_status_t saturn_online_send(const uint8_t* payload, uint16_t len)
         return SATURN_ONLINE_ERR_SEND_FAILED;
     }
 
-    /* Length prefix (big-endian) */
-    if (!saturn_uart_putc(&s_net.uart, (uint8_t)(len >> 8))) {
-        return SATURN_ONLINE_ERR_SEND_FAILED;
-    }
-    if (!saturn_uart_putc(&s_net.uart, (uint8_t)(len & 0xFF))) {
-        return SATURN_ONLINE_ERR_SEND_FAILED;
+    uint8_t hdr[2];
+    hdr[0] = (uint8_t)(len >> 8);
+    hdr[1] = (uint8_t)(len & 0xFF);
+
+    if (s_net.txbuf_enabled) {
+        /* Buffered path: atomic enqueue of header + payload. Return
+         * WOULDBLOCK if either part can't fit (don't split). */
+        if (txbuf_free(&s_net.txbuf) < (uint32_t)(2 + len)) {
+            s_net.stats.tx_frames_dropped++;
+            return SATURN_ONLINE_ERR_WOULDBLOCK;
+        }
+        if (!tx_enqueue(hdr, 2) || !tx_enqueue(payload, len)) {
+            s_net.stats.tx_frames_dropped++;
+            return SATURN_ONLINE_ERR_WOULDBLOCK;
+        }
+        s_net.stats.bytes_sent += 2 + len;
+        s_net.stats.frames_sent++;
+        return SATURN_ONLINE_OK;
     }
 
-    /* Payload */
-    for (i = 0; i < len; i++) {
-        if (!saturn_uart_putc(&s_net.uart, payload[i])) {
-            return SATURN_ONLINE_ERR_SEND_FAILED;
-        }
+    if (!tx_write_direct(hdr, 2) || !tx_write_direct(payload, len)) {
+        return SATURN_ONLINE_ERR_SEND_FAILED;
     }
 
     s_net.stats.bytes_sent += 2 + len;
@@ -764,10 +882,9 @@ saturn_online_status_t saturn_online_disconnect(void)
 
     if (!s_net.initialized) return SATURN_ONLINE_OK;
 
-    /* Tear down IRQ before modem escape (avoids ISR firing during AT mode) */
     irq_teardown();
 
-    if (s_net.state == SATURN_ONLINE_STATE_CONNECTED) {
+    if (s_net.state == SATURN_ONLINE_STATE_CONNECTED && !s_net.transport) {
         saturn_online_modem_escape_to_command(&s_net.uart);
         saturn_online_modem_command(&s_net.uart, "ATH0", buf, sizeof(buf));
     }
@@ -782,8 +899,10 @@ void saturn_online_shutdown(void)
 
     saturn_online_disconnect();
 
-    /* Power off the modem */
-    saturn_netlink_smpc_disable();
+    /* Power off the modem only when using the default UART transport. */
+    if (!s_net.transport) {
+        saturn_netlink_smpc_disable();
+    }
 
     s_net.initialized = false;
     s_net.uart_found = false;
@@ -794,24 +913,13 @@ void saturn_online_shutdown(void)
  * State & Statistics
  *============================================================================*/
 
-saturn_online_state_t saturn_online_get_state(void)
-{
-    return s_net.state;
-}
-
-bool saturn_online_is_connected(void)
-{
-    return s_net.state == SATURN_ONLINE_STATE_CONNECTED;
-}
-
-saturn_online_stats_t saturn_online_get_stats(void)
-{
-    return s_net.stats;
-}
+saturn_online_state_t saturn_online_get_state(void)   { return s_net.state; }
+bool saturn_online_is_connected(void)                 { return s_net.state == SATURN_ONLINE_STATE_CONNECTED; }
+saturn_online_stats_t saturn_online_get_stats(void)   { return s_net.stats; }
 
 void saturn_online_reset_stats(void)
 {
-    uint32_t baud = s_net.stats.baud_rate; /* preserve baud */
+    uint32_t baud = s_net.stats.baud_rate;
     memset(&s_net.stats, 0, sizeof(s_net.stats));
     s_net.stats.baud_rate = baud;
 }
@@ -854,6 +962,8 @@ const char* saturn_online_status_name(saturn_online_status_t status)
     case SATURN_ONLINE_ERR_SEND_FAILED:     return "Send failed";
     case SATURN_ONLINE_ERR_INVALID_CONFIG:  return "Invalid config";
     case SATURN_ONLINE_ERR_ALREADY_INIT:    return "Already initialized";
+    case SATURN_ONLINE_ERR_WOULDBLOCK:      return "Would block (TX full)";
+    case SATURN_ONLINE_ERR_INTERNAL:        return "Internal error";
     default:                                return "Unknown error";
     }
 }
@@ -864,13 +974,14 @@ const char* saturn_online_status_name(saturn_online_status_t status)
 
 const saturn_uart16550_t* saturn_online_get_uart(void)
 {
-    if (!s_net.initialized || !s_net.uart_found) return 0;
+    if (!s_net.initialized || !s_net.uart_found || s_net.transport) return 0;
     return &s_net.uart;
 }
 
 saturn_online_status_t saturn_online_reconnect(void)
 {
     if (!s_net.initialized) return SATURN_ONLINE_ERR_INVALID_CONFIG;
+    if (s_net.transport)    return SATURN_ONLINE_ERR_INVALID_CONFIG;
 
     saturn_online_status_t status = do_reconnect_internal();
     if (status == SATURN_ONLINE_OK) {
@@ -888,9 +999,8 @@ saturn_online_status_t saturn_online_at_command(const char* cmd,
     if (!s_net.initialized || !s_net.uart_found) {
         return SATURN_ONLINE_ERR_INVALID_CONFIG;
     }
-
     if (s_net.state == SATURN_ONLINE_STATE_CONNECTED) {
-        return SATURN_ONLINE_ERR_NOT_CONNECTED; /* can't AT in data mode */
+        return SATURN_ONLINE_ERR_NOT_CONNECTED;
     }
 
     saturn_online_modem_result_t r =

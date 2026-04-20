@@ -50,3 +50,12 @@ class TestInitPlaceholder:
         assert result.returncode == 0, \
             "test_init_placeholder failed:\n%s\n%s" % (result.stdout, result.stderr)
         assert "All checks passed." in result.stdout
+
+
+class TestTransportAndTxBuf:
+    def test_transport_override_and_txbuf(self):
+        _build_host(["test_transport_and_txbuf"])
+        result = _run("test_transport_and_txbuf")
+        assert result.returncode == 0, \
+            "test_transport_and_txbuf failed:\n%s\n%s" % (result.stdout, result.stderr)
+        assert "All checks passed." in result.stdout

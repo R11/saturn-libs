@@ -2,10 +2,9 @@
  * saturn_online_internal.h -- shared internal helpers
  *
  * Strictly private to the library's own translation units
- * (src/net.c, and in later phases src/connect_async.c and
- * src/matchmaking.c). Not part of the public API -- do not install
- * under include/. Callers who reach past the public headers are on
- * their own.
+ * (src/net.c, src/connect_async.c, src/matchmaking.c). Not part of the
+ * public API -- do not install under include/. Callers who reach past
+ * the public headers are on their own.
  */
 
 #ifndef SATURN_ONLINE_INTERNAL_H
@@ -14,6 +13,7 @@
 #include "saturn_online/net.h"
 #include "saturn_online/uart.h"
 #include "saturn_online/framing.h"
+#include "saturn_online/transport.h"
 #include "saturn_online/modem.h"
 
 #include <stdbool.h>
@@ -22,19 +22,29 @@
 /*============================================================================
  * Internal type: library singleton state
  *
- * Defined here so future TUs (Phase 3's connect_async.c and
- * matchmaking.c) can share the same state without duplicating logic.
- * Not for public consumption.
+ * Defined here so src/connect_async.c and src/matchmaking.c can share
+ * the same state without duplicating logic. Not for public consumption.
  *============================================================================*/
 
 #define SATURN_ONLINE_RINGBUF_SIZE  512   /* Must be power of 2 */
 #define SATURN_ONLINE_RINGBUF_MASK  (SATURN_ONLINE_RINGBUF_SIZE - 1)
+
+/* Hard upper bound on the optional TX ring buffer capacity. */
+#define SATURN_ONLINE_TX_BUFFER_MAX 2048
 
 typedef struct {
     volatile uint8_t  buf[SATURN_ONLINE_RINGBUF_SIZE];
     volatile uint16_t head;
     volatile uint16_t tail;
 } saturn_online_ringbuf_t;
+
+typedef struct {
+    uint8_t  buf[SATURN_ONLINE_TX_BUFFER_MAX];
+    uint32_t cap;
+    uint32_t head;
+    uint32_t tail;
+    uint32_t count;
+} saturn_online_txbuf_t;
 
 struct saturn_online_net_s {
     bool                        initialized;
@@ -49,6 +59,15 @@ struct saturn_online_net_s {
     bool                        irq_active;
 
     uint32_t                    dial_timeout_iters;
+
+    saturn_online_txbuf_t       txbuf;
+    bool                        txbuf_enabled;
+
+    uint32_t                    heartbeat_ticks_period;
+    uint32_t                    heartbeat_ticks_remaining;
+    uint32_t                    heartbeat_rx_watchdog;
+
+    const saturn_online_transport_t* transport;
 
     char                        last_modem_response[SATURN_ONLINE_MODEM_LINE_MAX];
     int                         last_modem_response_len;
