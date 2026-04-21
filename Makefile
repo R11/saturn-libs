@@ -24,12 +24,20 @@ CCFLAGS = -m2 -O2 -fomit-frame-pointer \
 
 .PHONY: all example clean
 
-all: $(BUILDDIR)/saturn_online.o
+OBJS = $(BUILDDIR)/net.o $(BUILDDIR)/connect_async.o $(BUILDDIR)/matchmaking.o
+
+all: $(OBJS)
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-$(BUILDDIR)/saturn_online.o: src/net.c | $(BUILDDIR)
+$(BUILDDIR)/net.o: src/net.c | $(BUILDDIR)
+	$(CC) $(CCFLAGS) -c $< -o $@
+
+$(BUILDDIR)/connect_async.o: src/connect_async.c | $(BUILDDIR)
+	$(CC) $(CCFLAGS) -c $< -o $@
+
+$(BUILDDIR)/matchmaking.o: src/matchmaking.c | $(BUILDDIR)
 	$(CC) $(CCFLAGS) -c $< -o $@
 
 example:

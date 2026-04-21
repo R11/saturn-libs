@@ -27,6 +27,7 @@ CCFLAGS = -m2 -O2 -fomit-frame-pointer \
 	-nostdlib -nodefaultlibs \
 	-I. \
 	-I$(LIB_INC) \
+	-I$(LIB_SRC) \
 	-I$(SGLDIR)/INC \
 	-D__SATURN__ -DSATURN
 
@@ -39,6 +40,14 @@ LDFLAGS = -m2 -nostartfiles \
 LIBS = $(SGLDIR)/LIB_ELF/SEGA_SYS.A \
        $(SGLDIR)/LIB_ELF/LIBSGL.A
 
+# The library splits into three source files:
+#   net.c           -- core (required)
+#   connect_async.c -- optional, adds saturn_online_connect_{start,tick}
+#   matchmaking.c   -- optional, adds saturn_online_matchmake
+#
+# hello uses only the blocking connect, so pulling net.c is enough. A
+# game that wants the non-blocking connect and/or the matchmake helper
+# adds the other two sources to its SRCS list.
 SRCS = main.c $(LIB_SRC)/net.c
 OBJS = $(BUILDDIR)/main.o $(BUILDDIR)/net.o
 
