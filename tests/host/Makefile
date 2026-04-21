@@ -21,7 +21,7 @@ LIB_SRC  := $(LIB_ROOT)/src
 CPPFLAGS += -I$(LIB_INC) -I$(LIB_SRC)
 
 TESTS := test_init_placeholder test_transport_and_txbuf test_connect_async \
-         test_matchmaking
+         test_matchmaking test_heartbeat
 
 .PHONY: all clean run
 
@@ -37,6 +37,9 @@ test_connect_async: test_connect_async.c $(LIB_SRC)/net.c $(LIB_SRC)/connect_asy
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@
 
 test_matchmaking: test_matchmaking.c $(LIB_SRC)/net.c $(LIB_SRC)/matchmaking.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@
+
+test_heartbeat: test_heartbeat.c $(LIB_SRC)/net.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@
 
 clean:

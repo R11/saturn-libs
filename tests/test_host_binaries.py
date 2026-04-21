@@ -73,6 +73,15 @@ class TestConnectAsync:
         assert "All checks passed." in result.stdout
 
 
+class TestHeartbeat:
+    def test_heartbeat_emission_and_watchdog(self):
+        _build_host(["test_heartbeat"])
+        result = _run("test_heartbeat")
+        assert result.returncode == 0, \
+            "test_heartbeat failed:\n%s\n%s" % (result.stdout, result.stderr)
+        assert "All checks passed." in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # Matchmaking: mock server + round-trip via saturn_online_matchmake()
 # ---------------------------------------------------------------------------
