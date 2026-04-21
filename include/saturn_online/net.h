@@ -341,6 +341,48 @@ saturn_online_status_t saturn_online_init(const saturn_online_config_t* config);
 saturn_online_status_t saturn_online_connect(void);
 
 /**
+ * Begin a non-blocking connect.
+ *
+ * Cooperative state-machine variant of saturn_online_connect(). Call
+ * once, then invoke saturn_online_connect_tick() each frame until it
+ * returns non-IN_PROGRESS. Useful inside frame-locked game loops
+ * (e.g. Jo Engine's jo_core_run) that must render while dialing.
+ *
+ * The blocking saturn_online_connect() remains available and is the
+ * known-good fallback if the non-blocking variant misbehaves.
+ *
+ * @return SATURN_ONLINE_OK if the connect was armed, or an error code
+ *         (ERR_INVALID_CONFIG if not initialized).
+ */
+saturn_online_status_t saturn_online_connect_start(void);
+
+/** Result of a single non-blocking connect tick. */
+typedef enum {
+    SATURN_ONLINE_TICK_IN_PROGRESS = 0,       /* Keep calling next frame */
+    SATURN_ONLINE_TICK_OK,                    /* Connection established */
+    SATURN_ONLINE_TICK_ERR_NO_MODEM,
+    SATURN_ONLINE_TICK_ERR_NO_RESPONSE,
+    SATURN_ONLINE_TICK_ERR_INIT_FAILED,
+    SATURN_ONLINE_TICK_ERR_NO_CARRIER,
+    SATURN_ONLINE_TICK_ERR_BUSY,
+    SATURN_ONLINE_TICK_ERR_NO_DIALTONE,
+    SATURN_ONLINE_TICK_ERR_NO_ANSWER,
+    SATURN_ONLINE_TICK_ERR_TIMEOUT,
+    SATURN_ONLINE_TICK_ERR_INVALID_CONFIG,
+    SATURN_ONLINE_TICK_ERR_INTERNAL
+} saturn_online_connect_tick_result_t;
+
+/**
+ * Advance the non-blocking connect state machine one step.
+ *
+ * Safe to call every frame. Performs a bounded amount of work per
+ * call (usually one AT exchange or one settle-step). Transitions to
+ * CONNECTED return SATURN_ONLINE_TICK_OK exactly once; subsequent
+ * calls continue to return OK until a new connect_start() is invoked.
+ */
+saturn_online_connect_tick_result_t saturn_online_connect_tick(void);
+
+/**
  * Process incoming data (non-blocking, call every frame).
  *
  * Reads available UART bytes, feeds them to the frame receiver, and

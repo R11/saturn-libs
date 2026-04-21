@@ -59,3 +59,12 @@ class TestTransportAndTxBuf:
         assert result.returncode == 0, \
             "test_transport_and_txbuf failed:\n%s\n%s" % (result.stdout, result.stderr)
         assert "All checks passed." in result.stdout
+
+
+class TestConnectAsync:
+    def test_nonblocking_connect_via_transport(self):
+        _build_host(["test_connect_async"])
+        result = _run("test_connect_async")
+        assert result.returncode == 0, \
+            "test_connect_async failed:\n%s\n%s" % (result.stdout, result.stderr)
+        assert "All checks passed." in result.stdout
