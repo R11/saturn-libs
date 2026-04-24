@@ -83,11 +83,11 @@ class TestHeartbeat:
 
 
 # ---------------------------------------------------------------------------
-# Matchmaking: mock server + round-trip via saturn_online_matchmake()
+# Matchmaking: mock server + round-trip via saturn_io_matchmake()
 # ---------------------------------------------------------------------------
 
 def _read_frame(conn):
-    """Read one saturn_online length-prefixed frame off the socket."""
+    """Read one saturn_io length-prefixed frame off the socket."""
     header = b""
     while len(header) < 2:
         chunk = conn.recv(2 - len(header))

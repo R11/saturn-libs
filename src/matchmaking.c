@@ -1,16 +1,16 @@
 /**
- * matchmaking.c -- saturn_online_matchmake implementation
+ * matchmaking.c -- saturn_io_matchmake implementation
  *
- * Owns a whole saturn_online session for the duration of a single
+ * Owns a whole saturn_io session for the duration of a single
  * dial-post-receive-hangup round-trip. See
- * include/saturn_online/matchmaking.h for the wire protocol.
+ * include/saturn_io/matchmaking.h for the wire protocol.
  */
 
-#include "saturn_online/matchmaking.h"
-#include "saturn_online/net.h"
-#include "saturn_online/framing.h"
-#include "saturn_online/transport.h"
-#include "saturn_online_internal.h"
+#include "saturn_io/matchmaking.h"
+#include "saturn_io/net.h"
+#include "saturn_io/framing.h"
+#include "saturn_io/transport.h"
+#include "saturn_io_internal.h"
 
 #include <string.h>
 
@@ -19,7 +19,7 @@
  * =========================================================================*/
 
 typedef struct {
-    saturn_online_matchmake_result_t* out;
+    saturn_io_matchmake_result_t* out;
     bool received;
     bool parse_failed;
 } matchmake_ctx_t;
@@ -71,18 +71,18 @@ static void matchmake_on_frame(const uint8_t* payload, uint16_t len, void* user)
  * Public API
  * =========================================================================*/
 
-saturn_online_status_t saturn_online_matchmake(
+saturn_io_status_t saturn_io_matchmake(
     const char* server_dial,
-    const saturn_online_matchmake_opts_t* opts,
-    saturn_online_matchmake_result_t* result)
+    const saturn_io_matchmake_opts_t* opts,
+    saturn_io_matchmake_result_t* result)
 {
-    if (!opts || !result) return SATURN_ONLINE_ERR_INVALID_CONFIG;
+    if (!opts || !result) return SATURN_IO_ERR_INVALID_CONFIG;
 
     /* Require either a dial number or a transport override. */
     if (!opts->transport) {
         if (!server_dial || server_dial[0] == '\0'
                 || strcmp(server_dial, "0000000") == 0) {
-            return SATURN_ONLINE_ERR_INVALID_CONFIG;
+            return SATURN_IO_ERR_INVALID_CONFIG;
         }
     }
 
@@ -95,21 +95,21 @@ saturn_online_status_t saturn_online_matchmake(
 
     uint32_t timeout_secs = opts->timeout_secs ? opts->timeout_secs : 30;
 
-    saturn_online_config_t cfg = SATURN_ONLINE_DEFAULTS;
+    saturn_io_config_t cfg = SATURN_IO_DEFAULTS;
     cfg.dial_number       = server_dial;
-    cfg.mode              = SATURN_ONLINE_MODE_DIAL;
+    cfg.mode              = SATURN_IO_MODE_DIAL;
     cfg.dial_timeout_secs = timeout_secs;
     cfg.on_frame          = matchmake_on_frame;
     cfg.user              = &ctx;
     cfg.transport         = opts->transport;
     cfg.advanced.monitor_dcd = false;  /* carry on even if DCD flaps */
 
-    saturn_online_status_t s = saturn_online_init(&cfg);
-    if (s != SATURN_ONLINE_OK) return s;
+    saturn_io_status_t s = saturn_io_init(&cfg);
+    if (s != SATURN_IO_OK) return s;
 
-    s = saturn_online_connect();
-    if (s != SATURN_ONLINE_OK) {
-        saturn_online_shutdown();
+    s = saturn_io_connect();
+    if (s != SATURN_IO_OK) {
+        saturn_io_shutdown();
         return s;
     }
 
@@ -132,10 +132,10 @@ saturn_online_status_t saturn_online_matchmake(
         req_len += name_len;
     }
 
-    s = saturn_online_send(req, req_len);
-    if (s != SATURN_ONLINE_OK) {
-        saturn_online_disconnect();
-        saturn_online_shutdown();
+    s = saturn_io_send(req, req_len);
+    if (s != SATURN_IO_OK) {
+        saturn_io_disconnect();
+        saturn_io_shutdown();
         return s;
     }
 
@@ -157,20 +157,20 @@ saturn_online_status_t saturn_online_matchmake(
     uint32_t poll_budget = timeout_secs * 200UL;  /* ~1 poll per 5ms */
     if (poll_budget == 0) poll_budget = 200;
 
-    saturn_online_status_t poll_status = SATURN_ONLINE_OK;
+    saturn_io_status_t poll_status = SATURN_IO_OK;
     while (poll_budget-- && !ctx.received && !ctx.parse_failed) {
-        poll_status = saturn_online_poll();
-        if (poll_status != SATURN_ONLINE_OK) break;
+        poll_status = saturn_io_poll();
+        if (poll_status != SATURN_IO_OK) break;
         /* Short busy-wait so the loop doesn't burn the budget in
          * microseconds on a fast host. On Saturn this overhead is
          * dwarfed by poll()'s own register polling. */
         for (volatile uint32_t d = 0; d < 50000UL; d++);
     }
 
-    saturn_online_disconnect();
-    saturn_online_shutdown();
+    saturn_io_disconnect();
+    saturn_io_shutdown();
 
-    if (ctx.parse_failed) return SATURN_ONLINE_ERR_INIT_FAILED;
-    if (!ctx.received)    return SATURN_ONLINE_ERR_TIMEOUT;
-    return SATURN_ONLINE_OK;
+    if (ctx.parse_failed) return SATURN_IO_ERR_INIT_FAILED;
+    if (!ctx.received)    return SATURN_IO_ERR_TIMEOUT;
+    return SATURN_IO_OK;
 }

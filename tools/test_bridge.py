@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for the saturn-online bridge.
+Tests for the saturn-io bridge.
 
 Unit tests:
     - parse_server_arg
@@ -221,7 +221,7 @@ class TestBridgeIntegration:
             # Give bridge time to accept + connect to echo server
             time.sleep(0.5)
 
-            # Send a saturn-online framed payload: [LEN_HI][LEN_LO][payload]
+            # Send a saturn-io framed payload: [LEN_HI][LEN_LO][payload]
             payload = b"hello"
             frame = bytes([0, len(payload)]) + payload
             client.sendall(frame)

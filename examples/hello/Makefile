@@ -1,5 +1,5 @@
 #
-# examples/hello/Makefile - build the saturn-online hello example
+# examples/hello/Makefile - build the saturn-io hello example
 #
 # This builds a Saturn ROM image using the SH-2 toolchain + SGL inside
 # the saturn-tools Docker SDK.  Toolchain paths match the canvas app
@@ -42,8 +42,8 @@ LIBS = $(SGLDIR)/LIB_ELF/SEGA_SYS.A \
 
 # The library splits into three source files:
 #   net.c           -- core (required)
-#   connect_async.c -- optional, adds saturn_online_connect_{start,tick}
-#   matchmaking.c   -- optional, adds saturn_online_matchmake
+#   connect_async.c -- optional, adds saturn_io_connect_{start,tick}
+#   matchmaking.c   -- optional, adds saturn_io_matchmake
 #
 # hello uses only the blocking connect, so pulling net.c is enough. A
 # game that wants the non-blocking connect and/or the matchmake helper
@@ -85,8 +85,8 @@ $(TARGET_RAW): $(TARGET) $(BUILDDIR)/cd
 $(TARGET_ISO): $(TARGET_RAW)
 	$(MKISOFS) -quiet -sysid "SEGA SATURN" -volid "SatOnline" \
 		-volset "SatOnline" -sectype 2352 \
-		-publisher "saturn-online example" \
-		-preparer "saturn-online example" \
+		-publisher "saturn-io example" \
+		-preparer "saturn-io example" \
 		-appid "SatOnlineHello" \
 		-generic-boot $(SATURN_SDK_ROOT)/IP.BIN \
 		-full-iso9660-filenames -o $(TARGET_ISO) $(BUILDDIR)/cd

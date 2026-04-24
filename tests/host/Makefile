@@ -1,4 +1,4 @@
-# Host-side unit tests for saturn-online.
+# Host-side unit tests for saturn-io.
 #
 # These tests compile src/net.c (and later matchmaking.c / connect_async.c)
 # against the host toolchain without __SATURN__ defined, so we can

@@ -1,5 +1,5 @@
 #
-# saturn-online/Makefile - build the library as a single object
+# saturn-io/Makefile - build the library as a single object
 #
 # This Makefile compiles src/net.c against the SH-2 toolchain and SGL
 # headers supplied by saturn-tools' SDK.  Consumers usually don't need

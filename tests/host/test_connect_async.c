@@ -12,8 +12,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "saturn_online/net.h"
-#include "saturn_online/transport.h"
+#include "saturn_io/net.h"
+#include "saturn_io/transport.h"
 
 /* ------------------------------------------------------------------------- */
 
@@ -36,7 +36,7 @@ static int     ft_send(void* c, const uint8_t* d, int l) {
 static bool    ft_is_connected(void* c) { fake_transport_t* f = c; return f->connected; }
 
 static fake_transport_t g_ft = { .connected = true };
-static const saturn_online_transport_t g_transport = {
+static const saturn_io_transport_t g_transport = {
     ft_rx_ready, ft_rx_byte, ft_send, ft_is_connected, &g_ft
 };
 
@@ -55,41 +55,41 @@ static int expect(const char* label, int got, int want) {
 int main(void) {
     int failures = 0;
 
-    saturn_online_config_t cfg = SATURN_ONLINE_DEFAULTS;
+    saturn_io_config_t cfg = SATURN_IO_DEFAULTS;
     cfg.on_frame  = on_frame;
     cfg.transport = &g_transport;
     cfg.advanced.monitor_dcd = false;
 
     failures += expect("init with transport",
-                       saturn_online_init(&cfg),
-                       SATURN_ONLINE_OK);
+                       saturn_io_init(&cfg),
+                       SATURN_IO_OK);
 
     failures += expect("state is IDLE after init",
-                       saturn_online_get_state(),
-                       SATURN_ONLINE_STATE_IDLE);
+                       saturn_io_get_state(),
+                       SATURN_IO_STATE_IDLE);
 
     failures += expect("connect_start OK",
-                       saturn_online_connect_start(),
-                       SATURN_ONLINE_OK);
+                       saturn_io_connect_start(),
+                       SATURN_IO_OK);
 
-    saturn_online_connect_tick_result_t r1 = saturn_online_connect_tick();
+    saturn_io_connect_tick_result_t r1 = saturn_io_connect_tick();
     failures += expect("first tick returns TICK_OK (transport)",
-                       r1, SATURN_ONLINE_TICK_OK);
+                       r1, SATURN_IO_TICK_OK);
 
     failures += expect("state is CONNECTED",
-                       saturn_online_get_state(),
-                       SATURN_ONLINE_STATE_CONNECTED);
+                       saturn_io_get_state(),
+                       SATURN_IO_STATE_CONNECTED);
 
     /* Subsequent ticks continue to report OK. */
-    saturn_online_connect_tick_result_t r2 = saturn_online_connect_tick();
+    saturn_io_connect_tick_result_t r2 = saturn_io_connect_tick();
     failures += expect("second tick remains TICK_OK",
-                       r2, SATURN_ONLINE_TICK_OK);
+                       r2, SATURN_IO_TICK_OK);
 
     /* Round-trip: send a frame, feed one back via RX. */
     uint8_t hi[] = { 'h', 'i' };
     failures += expect("send works post-async-connect",
-                       saturn_online_send(hi, 2),
-                       SATURN_ONLINE_OK);
+                       saturn_io_send(hi, 2),
+                       SATURN_IO_OK);
     failures += expect("transport received framed hi",
                        g_ft.tx_len >= 4 ? 1 : 0, 1);
 
@@ -98,7 +98,7 @@ int main(void) {
     memcpy(g_ft.rx_buf, reply, sizeof(reply));
     g_ft.rx_len = sizeof(reply);
     g_ft.rx_pos = 0;
-    saturn_online_poll();
+    saturn_io_poll();
     failures += expect("RX frame via transport",
                        g_frames, 1);
 

@@ -1,5 +1,5 @@
 /**
- * hello online - minimal saturn-online example
+ * hello online - minimal saturn-io example
  *
  * Connects via NetLink, sends a "hello" payload, prints any echo
  * it receives.  Requires a PC-side listener such as:
@@ -15,7 +15,7 @@
  * format at all.  Byte 0 of the payload is the letter 'h' of "hello".
  */
 
-#include <saturn_online/net.h>
+#include <saturn_io/net.h>
 
 #include <sl_def.h>   /* SGL prototypes: slSynch, slPrint, slInitSystem, etc. */
 #include <string.h>
@@ -43,8 +43,8 @@ static void on_frame(const uint8_t* payload, uint16_t len, void* user)
     (void)user;
     /* Treat the frame as ASCII for display.  Real games would interpret
      * payload[0] as their own protocol opcode. */
-    char buf[SATURN_ONLINE_MAX_PAYLOAD + 8];
-    int n = (len > SATURN_ONLINE_MAX_PAYLOAD) ? SATURN_ONLINE_MAX_PAYLOAD : len;
+    char buf[SATURN_IO_MAX_PAYLOAD + 8];
+    int n = (len > SATURN_IO_MAX_PAYLOAD) ? SATURN_IO_MAX_PAYLOAD : len;
     int i;
     int pos = 0;
     buf[pos++] = 'R';
@@ -63,23 +63,23 @@ static void on_frame(const uint8_t* payload, uint16_t len, void* user)
 
 void ss_main(void)
 {
-    saturn_online_config_t cfg = SATURN_ONLINE_DEFAULTS;
+    saturn_io_config_t cfg = SATURN_IO_DEFAULTS;
     cfg.dial_number  = "#555#";     /* bridge answers whatever we dial; the
                                        previous "0000000" placeholder is now
-                                       rejected by saturn_online_init */
+                                       rejected by saturn_io_init */
     cfg.on_frame     = on_frame;
     cfg.on_status    = on_status;
 
     slInitSystem(TV_320x224, NULL, 1);
     slPrintHZ(0, NULL);
-    put("saturn-online hello");
+    put("saturn-io hello");
 
-    if (saturn_online_init(&cfg) != SATURN_ONLINE_OK) {
+    if (saturn_io_init(&cfg) != SATURN_IO_OK) {
         put("init failed");
         while (1) slSynch();
     }
 
-    if (saturn_online_connect() != SATURN_ONLINE_OK) {
+    if (saturn_io_connect() != SATURN_IO_OK) {
         put("connect failed");
         while (1) slSynch();
     }
@@ -87,13 +87,13 @@ void ss_main(void)
     /* Fire off the hello once. */
     {
         static const uint8_t hello[] = { 'h', 'e', 'l', 'l', 'o' };
-        saturn_online_send(hello, (uint16_t)sizeof(hello));
+        saturn_io_send(hello, (uint16_t)sizeof(hello));
         put("sent: hello");
     }
 
     /* Poll forever. */
     while (1) {
         slSynch();
-        saturn_online_poll();
+        saturn_io_poll();
     }
 }

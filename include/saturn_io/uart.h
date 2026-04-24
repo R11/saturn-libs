@@ -1,5 +1,5 @@
 /**
- * saturn_online/uart.h - 16550 UART Driver for Saturn NetLink Modem
+ * saturn_io/uart.h - 16550 UART Driver for Saturn NetLink Modem
  *
  * The Saturn NetLink modem (MK-80118) exposes a 16550-compatible UART on
  * the A-bus (cartridge slot). The modem contains a Rockwell L39 controller
@@ -31,8 +31,8 @@
  *     http://wiki.yabause.org/index.php5?title=SMPC
  */
 
-#ifndef SATURN_ONLINE_UART_H
-#define SATURN_ONLINE_UART_H
+#ifndef SATURN_IO_UART_H
+#define SATURN_IO_UART_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -538,4 +538,4 @@ static inline bool saturn_uart_loopback_test(const saturn_uart16550_t* uart) {
     return ok;
 }
 
-#endif /* SATURN_ONLINE_UART_H */
+#endif /* SATURN_IO_UART_H */

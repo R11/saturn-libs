@@ -2,23 +2,23 @@
  * test_matchmaking.c -- host-side unit test
  *
  * Spins up a TCP connection (the caller supplies a port via argv[1])
- * and exercises the saturn_online_matchmake() round-trip against a
+ * and exercises the saturn_io_matchmake() round-trip against a
  * mock Python matchmaking server (see tests/test_host_binaries.py).
  *
- * Protocol (mirrors include/saturn_online/matchmaking.h):
+ * Protocol (mirrors include/saturn_io/matchmaking.h):
  *   REQUEST : [u16 game_id BE][u8 name_len][name_len bytes]
  *   RESPONSE: [u8 opponent_id][u8 dial_len][dial bytes]
  *             [u8 extra_len][extra bytes]
- * Both wrapped in saturn_online's length-prefixed framing.
+ * Both wrapped in saturn_io's length-prefixed framing.
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-#include "saturn_online/net.h"
-#include "saturn_online/matchmaking.h"
-#include "saturn_online/transport.h"
+#include "saturn_io/net.h"
+#include "saturn_io/matchmaking.h"
+#include "saturn_io/transport.h"
 
 #include "tcp_transport.h"
 
@@ -49,24 +49,24 @@ int main(int argc, char* argv[]) {
         return 3;
     }
 
-    saturn_online_transport_t transport;
+    saturn_io_transport_t transport;
     tcp_xport_fill(&transport, &tc);
 
     int failures = 0;
 
-    saturn_online_matchmake_opts_t opts = {0};
+    saturn_io_matchmake_opts_t opts = {0};
     opts.game_id       = 0x1337;
     opts.username      = "saturn-player-1";
     opts.timeout_secs  = 5;
     opts.transport     = &transport;
 
-    saturn_online_matchmake_result_t result;
-    saturn_online_status_t s = saturn_online_matchmake(
+    saturn_io_matchmake_result_t result;
+    saturn_io_status_t s = saturn_io_matchmake(
         NULL, /* server_dial ignored when transport supplied */
         &opts, &result);
 
     failures += expect_i("matchmake returns OK",
-                         (int)s, SATURN_ONLINE_OK);
+                         (int)s, SATURN_IO_OK);
     failures += expect_i("opponent_id == 42",
                          result.opponent_id, 42);
     failures += expect_str("opponent_dial correct",

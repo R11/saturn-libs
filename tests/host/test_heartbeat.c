@@ -9,14 +9,14 @@
  *
  * The library converts "seconds" to "poll ticks at 60 Hz", so on a
  * host driven by direct poll() calls one second == 60 polls. We
- * emulate this by calling saturn_online_poll() that many times.
+ * emulate this by calling saturn_io_poll() that many times.
  */
 
 #include <stdio.h>
 #include <string.h>
 
-#include "saturn_online/net.h"
-#include "saturn_online/transport.h"
+#include "saturn_io/net.h"
+#include "saturn_io/transport.h"
 
 /* ------------------------------------------------------------------------- */
 
@@ -40,7 +40,7 @@ static int     ft_send(void* c, const uint8_t* d, int l) {
 static bool    ft_is_connected(void* c) { fake_transport_t* f = c; return f->connected; }
 
 static fake_transport_t g_ft = { .connected = true };
-static const saturn_online_transport_t g_transport = {
+static const saturn_io_transport_t g_transport = {
     ft_rx_ready, ft_rx_byte, ft_send, ft_is_connected, &g_ft
 };
 
@@ -48,11 +48,11 @@ static void on_frame(const uint8_t* p, uint16_t l, void* u) { (void)p; (void)l; 
 
 /* Capture the most recent state callback so the test can assert the
  * watchdog fired. */
-static saturn_online_state_t  g_last_state_new  = SATURN_ONLINE_STATE_IDLE;
-static saturn_online_status_t g_last_state_code = SATURN_ONLINE_OK;
+static saturn_io_state_t  g_last_state_new  = SATURN_IO_STATE_IDLE;
+static saturn_io_status_t g_last_state_code = SATURN_IO_OK;
 
-static void on_state(saturn_online_state_t o, saturn_online_state_t n,
-                      saturn_online_status_t s, void* u) {
+static void on_state(saturn_io_state_t o, saturn_io_state_t n,
+                      saturn_io_status_t s, void* u) {
     (void)o; (void)u;
     g_last_state_new  = n;
     g_last_state_code = s;
@@ -79,15 +79,15 @@ static int expect_ge(const char* label, uint32_t got, uint32_t want_at_least) {
 int main(void) {
     int failures = 0;
 
-    saturn_online_config_t cfg = SATURN_ONLINE_DEFAULTS;
+    saturn_io_config_t cfg = SATURN_IO_DEFAULTS;
     cfg.on_frame  = on_frame;
     cfg.on_state  = on_state;
     cfg.transport = &g_transport;
     cfg.advanced.monitor_dcd    = false;
     cfg.advanced.heartbeat_secs = 1;   /* period = 60 ticks, watchdog = 120 */
 
-    failures += expect_i("init", saturn_online_init(&cfg), SATURN_ONLINE_OK);
-    failures += expect_i("connect", saturn_online_connect(), SATURN_ONLINE_OK);
+    failures += expect_i("init", saturn_io_init(&cfg), SATURN_IO_OK);
+    failures += expect_i("connect", saturn_io_connect(), SATURN_IO_OK);
 
     /* --- heartbeat emission cadence ---
      *
@@ -104,10 +104,10 @@ int main(void) {
         g_ft.rx_buf[0] = keepalive_byte;
         g_ft.rx_len = 1;
         g_ft.rx_pos = 0;
-        saturn_online_poll();
+        saturn_io_poll();
     }
 
-    saturn_online_stats_t s1 = saturn_online_get_stats();
+    saturn_io_stats_t s1 = saturn_io_get_stats();
     failures += expect_i("one heartbeat after 60 polls",
                          s1.heartbeats_sent, 1);
     failures += expect_ge("transport got >=3 heartbeat bytes",
@@ -117,9 +117,9 @@ int main(void) {
         g_ft.rx_buf[0] = keepalive_byte;
         g_ft.rx_len = 1;
         g_ft.rx_pos = 0;
-        saturn_online_poll();
+        saturn_io_poll();
     }
-    s1 = saturn_online_get_stats();
+    s1 = saturn_io_get_stats();
     failures += expect_i("two heartbeats after 120 polls",
                          s1.heartbeats_sent, 2);
 
@@ -129,15 +129,15 @@ int main(void) {
      * without data; on the 120th iteration the watchdog triggers. */
     g_ft.rx_len = 0;
     g_ft.rx_pos = 0;
-    for (int i = 0; i < 200 && saturn_online_get_state()
-                                    == SATURN_ONLINE_STATE_CONNECTED; i++) {
-        saturn_online_poll();
+    for (int i = 0; i < 200 && saturn_io_get_state()
+                                    == SATURN_IO_STATE_CONNECTED; i++) {
+        saturn_io_poll();
     }
 
     failures += expect_i("watchdog moved state to DISCONNECTED",
-                         g_last_state_new, SATURN_ONLINE_STATE_DISCONNECTED);
+                         g_last_state_new, SATURN_IO_STATE_DISCONNECTED);
     failures += expect_i("watchdog status == ERR_TIMEOUT",
-                         g_last_state_code, SATURN_ONLINE_ERR_TIMEOUT);
+                         g_last_state_code, SATURN_IO_ERR_TIMEOUT);
 
     if (failures == 0) {
         printf("\nAll checks passed.\n");

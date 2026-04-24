@@ -15,7 +15,7 @@ Usage:
     python3 tools/echo_server.py --host 127.0.0.1 --port 4821
 
 The server is frame-agnostic: it echoes raw bytes, so any framing used
-by the caller (including the saturn-online [LEN_HI][LEN_LO][payload]
+by the caller (including the saturn-io [LEN_HI][LEN_LO][payload]
 format) round-trips intact.
 """
 
@@ -71,7 +71,7 @@ def serve(host: str, port: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Minimal TCP echo server for saturn-online round-trip "
+        description="Minimal TCP echo server for saturn-io round-trip "
                     "testing.")
     parser.add_argument("--host", default="0.0.0.0",
                         help="Bind address (default: 0.0.0.0)")

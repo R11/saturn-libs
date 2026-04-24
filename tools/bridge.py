@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-saturn-online NetLink Modem-to-TCP Bridge
+saturn-io NetLink Modem-to-TCP Bridge
 
 Answers incoming modem calls from the Sega Saturn NetLink and relays
 bytes bidirectionally to/from a TCP server.  The bridge is transparent
@@ -45,7 +45,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("saturn_online_bridge")
+log = logging.getLogger("saturn_io_bridge")
 
 DEFAULT_BAUD = 9600
 DEFAULT_SERVER = "localhost:4821"
@@ -582,7 +582,7 @@ def parse_server_arg(s: str) -> tuple:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="saturn-online NetLink Modem-to-TCP Bridge"
+        description="saturn-io NetLink Modem-to-TCP Bridge"
     )
     parser.add_argument(
         "--serial-port",

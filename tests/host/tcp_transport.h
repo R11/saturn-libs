@@ -1,13 +1,13 @@
 /*
- * tcp_transport.h -- BSD-socket-backed saturn_online transport for
+ * tcp_transport.h -- BSD-socket-backed saturn_io transport for
  * host-side tests.
  *
  * This is test infrastructure only. It is NOT part of the library.
  * Do not ship or reuse on the Saturn side.
  */
 
-#ifndef SATURN_ONLINE_TEST_TCP_TRANSPORT_H
-#define SATURN_ONLINE_TEST_TCP_TRANSPORT_H
+#ifndef SATURN_IO_TEST_TCP_TRANSPORT_H
+#define SATURN_IO_TEST_TCP_TRANSPORT_H
 
 #ifdef __SATURN__
 #error "tcp_transport.h is host-test-only -- do not include on Saturn"
@@ -21,7 +21,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "saturn_online/transport.h"
+#include "saturn_io/transport.h"
 
 typedef struct {
     int fd;
@@ -78,7 +78,7 @@ static void tcp_xport_close(tcp_transport_ctx_t* ctx) {
     }
 }
 
-static void tcp_xport_fill(saturn_online_transport_t* t, tcp_transport_ctx_t* ctx) {
+static void tcp_xport_fill(saturn_io_transport_t* t, tcp_transport_ctx_t* ctx) {
     t->rx_ready     = tcp_xport_rx_ready;
     t->rx_byte      = tcp_xport_rx_byte;
     t->send         = tcp_xport_send;
@@ -86,4 +86,4 @@ static void tcp_xport_fill(saturn_online_transport_t* t, tcp_transport_ctx_t* ct
     t->ctx          = ctx;
 }
 
-#endif /* SATURN_ONLINE_TEST_TCP_TRANSPORT_H */
+#endif /* SATURN_IO_TEST_TCP_TRANSPORT_H */
