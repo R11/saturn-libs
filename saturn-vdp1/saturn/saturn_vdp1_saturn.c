@@ -31,21 +31,17 @@
  *       races nothing — the previous frame's auto-draw already
  *       completed long before we get here.
  *
- *   Write ordering inside sat_flush is END-FIRST: we plant a fresh
- *   END at slot 4+N BEFORE we touch any of the quad slots 4..4+N-1.
- *   This closes a small race against VDP1's forward walk during the
- *   display period. If a previous frame had a longer command list,
- *   the slot at 4+N currently holds an old quad; if we wrote the new
- *   quads first and the END last, there is a window where slot 4+N-1
- *   holds a fresh quad while slot 4+N still holds a stale quad —
- *   if VDP1 happens to be walking the list during that window (e.g.
- *   for next-frame auto-draw fetch, or any speculative read), it
- *   sees "good quad followed by stale quad" instead of "good quad
- *   followed by END" and renders garbage at the tail of the list.
- *   The snake game's head (highest-index quad) flickered for exactly
- *   this reason. Writing END first means VDP1, at any intermediate
- *   point, either sees the OLD list (untouched yet) or the NEW list
- *   correctly terminated — never a mixed list with a stale tail.
+ *   Write ordering inside sat_flush mirrors arcade's
+ *   prewrite_vdp1_vram() exactly (arcade/lib/saturn/vdp1/
+ *   saturn_vdp1.c:409-465): walk slots LOW→HIGH, writing each polygon
+ *   in turn, and write the END marker at slot 4+N LAST. VDP1 in SGL's
+ *   auto-draw mode reads the command list once per frame at vblank-
+ *   in, not continuously during the display period, so display-period
+ *   writes do not race the GPU walk. An earlier END-first / reverse-
+ *   walk attempt (Pass 3) was reverted because it fixed a theoretical
+ *   race that does not actually occur and exposed a real window where
+ *   the new END terminated the list before the new quads were
+ *   written, leaving stale quads visible at the tail.
  *
  *   The previous double-buffered "stage in CPU buffer, copy in vblank
  *   callback" design was wrong: by the time the vblank callback ran,
@@ -91,9 +87,18 @@
 
 #define VDP1_VRAM           0x25C00000u
 #define VDP1_EWDR           0x25D00006u
+#define VDP1_EDSR           0x25D00010u            /* Draw End Status Register */
+#define VDP1_EDSR_CEF       0x0002u                /* Current frame End Flag */
 #define VDP1_CMD_BYTES      0x20u                  /* 32-byte command */
 #define VDP1_USER_FIRST     4u                     /* first slot we own */
-#define VDP1_SLOT_CAP       512u                   /* matches SATURN_VDP1_MAX_QUADS */
+/* Gouraud shading tables sit at VDP1 VRAM offset 0x2100, which is
+ * slot 264 (each command is 0x20 bytes, 0x2100 / 0x20 = 264). Reserving
+ * slots 4..259 for user commands plus slot 260 for the END marker
+ * leaves the Gouraud region untouched. Mirrors arcade's
+ * SATURN_VDP1_SLOT_CAP = 260 at arcade/lib/saturn/vdp1/saturn_vdp1.h:72.
+ * Note: SATURN_VDP1_MAX_QUADS in the public header is the CPU-side
+ * per-frame quad cap (independent of this VRAM slot cap). */
+#define VDP1_SLOT_CAP       260u
 
 /* VDP2 sprite/scroll-plane priority registers. Setting these from the
  * vblank callback ensures our priorities survive SGL's per-frame
@@ -288,35 +293,34 @@ static saturn_result_t sat_flush(void* ctx,
         n = (uint16_t)(VDP1_SLOT_CAP - VDP1_USER_FIRST - 1);
     }
 
-    /* END-FIRST ordering (see top-of-file comment). Plant the new END
-     * at slot 4+n BEFORE writing any quads. If a previous frame had a
-     * longer list, the slot we'd land a quad in at index n-1 currently
-     * holds a stale quad whose own next-slot is also a stale quad; if
-     * we wrote quads first and END last, there's a window where the
-     * partially-updated list ends in stale data. Writing END first
-     * means at every intermediate point the list is either fully old
-     * (not yet touched) or correctly terminated. */
-    vram_write_end(VDP1_USER_FIRST + n);
-
-    /* Encode each polygon into a stack-local command and write it
-     * straight into VDP1 VRAM at the user slot. We are on the main
-     * thread during the display period; VDP1 finished rasterising the
-     * previous frame's commands well before we got here (auto-draw
-     * runs during vblank-out, ends long before the next vblank-in),
-     * and SGL only touches slots 0..3. So slots 4+ are ours to write
-     * without a tear. This mirrors arcade and bomberman exactly.
+    /* Wait for VDP1 to finish drawing the previous frame before writing
+     * commands. Without this, when game logic completes faster than VDP1
+     * can render the previous frame's commands (the "transfer-over"
+     * boundary documented in PROGRAM2.txt around 20+ commands), our
+     * writes to slot N race VDP1's read of slot N — VDP1 sees stale
+     * data from the previous frame's higher-indexed slots. Symptom: the
+     * cell the head was in last frame flickers as snake length grows.
      *
-     * Walk highest-index to lowest so that, if VDP1 does speculatively
-     * read the list mid-flush, it encounters our freshly-placed END
-     * before any newly-overwritten quad slot. */
-    for (i = n; i > 0; --i) {
-        uint16_t idx = (uint16_t)(i - 1);
-        encode_polygon(&cmd,
-                       quads[idx].x, quads[idx].y,
-                       quads[idx].w, quads[idx].h,
-                       quads[idx].color);
-        vram_write_cmd(VDP1_USER_FIRST + idx, &cmd);
+     * Coup uses this exact pattern (coup-saturn/pal/saturn/saturn_vdp1.c
+     * :347-353). EDSR.CEF=1 means the current frame's draw is complete
+     * and VDP1 is idle; we can write VRAM without contention. Typically
+     * VDP1 finishes well before game logic does, so this rarely spins. */
+    while (!(*(volatile Uint16*)(uintptr_t)VDP1_EDSR & VDP1_EDSR_CEF)) {
+        /* spin */
     }
+
+    /* Walk LOW→HIGH, write END LAST. Mirrors arcade's
+     * prewrite_vdp1_vram() at arcade/lib/saturn/vdp1/saturn_vdp1.c:
+     * 409-465. VDP1 in auto-draw reads the command list once per frame
+     * at vblank, so display-period writes do not race the GPU walk. */
+    for (i = 0; i < n; ++i) {
+        encode_polygon(&cmd,
+                       quads[i].x, quads[i].y,
+                       quads[i].w, quads[i].h,
+                       quads[i].color);
+        vram_write_cmd(VDP1_USER_FIRST + i, &cmd);
+    }
+    vram_write_end(VDP1_USER_FIRST + n);
 
     /* Now that real commands are sitting in VRAM, slot 3 can safely
      * be patched from END to LOCAL_COORD. */
