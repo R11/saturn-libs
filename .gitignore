@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+*.o
+*.elf
+*.iso
+*.cue
+*.map
+*.raw
+*.a
+
+# Host-side unit test binaries
+tests/host/test_*
+!tests/host/test_*.c
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# macOS
+.DS_Store
+
+# Editor / agent state
+.claude/
+worktrees/
+
+# Migration leftovers
+saturn-io.tomove/
