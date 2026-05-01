@@ -1,0 +1,20 @@
+# Project-wide clangd fallback. Per-TU flags come from
+# compile_commands.json (regenerated via `bear -- make test`).
+#
+# This file only supplies *fallback* flags for files clangd opens that
+# are not in compile_commands.json — most importantly the public
+# headers under include/saturn_bup/, which may be edited standalone
+# before clangd has indexed an including .c file. Without these
+# fallbacks, opening pal.h / host.h / saturn.h yields spurious
+# "'saturn_bup.h' file not found" diagnostics.
+#
+# The cross-compile shell saturn/sbup_saturn.c is suppressed
+# separately by saturn/.clangd.
+
+CompileFlags:
+  Add:
+    - -xc
+    - -std=c99
+    - -Iinclude
+    - -I../saturn-base/include
+    - -I../test/include

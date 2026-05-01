@@ -18,6 +18,9 @@
 #include <saturn_app/scene.h>
 #include <saturn_app/game.h>
 #include <saturn_app/state.h>
+#include <saturn_app/identity.h>
+#include <saturn_app/local_lobby.h>
+#include <saturn_app/online.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,6 +50,28 @@ uint32_t      sapp_frame_count   (void);
 
 /* Drive the state machine externally (used by tests / harnesses). */
 void sapp_force_state(lobby_state_t s);
+
+/* Identity bootstrap. The platform shell calls this once after installing
+ * the BUP PAL and before sapp_run_one_frame(). The framework loads the
+ * LOBBY_ID record (or fills a default if missing/corrupt) and decides the
+ * starting state: NAME_ENTRY_FIRST_RUN if the loaded record has an empty
+ * current_name, otherwise TITLE. Returns the loaded identity for the
+ * caller to inspect. Calling sapp_init() resets identity to a NULL state;
+ * sapp_bootstrap_identity() must be called after sapp_init(). */
+const sapp_identity_t* sapp_bootstrap_identity(void);
+
+/* Read the framework's current identity. NULL if bootstrap hasn't run. */
+const sapp_identity_t* sapp_get_identity(void);
+
+/* Replace the framework's identity wholesale. Used by tests that want
+ * to install a synthetic identity without going through BUP. Does NOT
+ * persist to BUP; for that, save via sapp_identity_save() before/after. */
+void sapp_set_identity(const sapp_identity_t* id);
+
+/* Title-splash NBG1 backdrop. Procedural gradient by default; user can
+ * substitute a PNG-derived rgb555 image by editing the definition in
+ * core/saturn_app_core.c. */
+extern const lobby_bg_image_t g_title_bg;
 
 #ifdef __cplusplus
 }

@@ -23,6 +23,18 @@ extern "C" {
 
 #define LOBBY_MAX_PLAYERS    8u
 
+/* Optional per-game background image. The platform shell (Saturn lobby
+ * shell) reads this to upload an NBG1 backdrop while a game is in
+ * PLAYING. If `rgb555` is non-NULL, the shell uploads it directly. Else
+ * if `paint_procedural` is non-NULL the shell calls it once with a
+ * scratch buffer (320x224 RGB555 in main RAM), then uploads the buffer.
+ * If both are NULL, the shell clears NBG1 to a default colour. */
+typedef struct lobby_bg_image {
+    uint16_t        w, h;
+    const uint16_t* rgb555;
+    void          (*paint_procedural)(uint16_t* dst, uint16_t w, uint16_t h);
+} lobby_bg_image_t;
+
 typedef uint16_t lobby_input_t;   /* matches saturn-smpc button bitmask */
 
 typedef enum {
@@ -59,6 +71,12 @@ typedef struct lobby_game {
     void (*render_scene)(const void* state, lobby_scene_t* out);
     void (*is_done)     (const void* state, lobby_game_result_t* out);
     void (*teardown)    (void* state);
+
+    /* Optional NBG1 backdrop. NULL means "no per-game backdrop" — the
+     * shell falls back to clearing NBG1 to a flat colour. Place at the
+     * end so positional initialisers in existing games can append a
+     * single trailing NULL. */
+    const lobby_bg_image_t* background_image;
 } lobby_game_t;
 
 #ifdef __cplusplus

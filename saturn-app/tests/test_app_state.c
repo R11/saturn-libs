@@ -30,9 +30,15 @@ static void stub_is_done(const void* s, lobby_game_result_t* out) {
 }
 static void stub_teardown(void* s) { (void)s; }
 
+static void stub_paint(uint16_t* dst, uint16_t w, uint16_t h) {
+    (void)dst; (void)w; (void)h;
+}
+static const lobby_bg_image_t k_stub_bg = { 320, 224, 0, stub_paint };
+
 static const lobby_game_t k_stub = {
     "stub", "Stub Game", 1, 1, sizeof(stub_state_t),
-    stub_init, stub_tick, stub_render, stub_is_done, stub_teardown
+    stub_init, stub_tick, stub_render, stub_is_done, stub_teardown,
+    &k_stub_bg
 };
 
 static lobby_input_t inp[LOBBY_MAX_PLAYERS];
@@ -126,9 +132,26 @@ SATURN_TEST(app_renders_game_scene_when_playing) {
 SATURN_TEST(app_register_rejects_oversize_state) {
     static const lobby_game_t huge = {
         "huge", "Huge", 1, 1, SAPP_GAME_STATE_BYTES + 1,
-        NULL, NULL, NULL, NULL, NULL
+        NULL, NULL, NULL, NULL, NULL,
+        NULL
     };
     SATURN_ASSERT_EQ(sapp_register_game(&huge), SATURN_ERR_NO_SPACE);
+}
+
+SATURN_TEST(app_bg_image_ref_tracks_state) {
+    /* TITLE -> g_title_bg (always present, exported by saturn_app). */
+    const lobby_scene_t* s = sapp_run_one_frame(inp);
+    SATURN_ASSERT_EQ(s->bg_image_ref, &g_title_bg);
+
+    /* TITLE -> SELECT clears bg. */
+    inp[0] = INP_START; sapp_run_one_frame(inp);
+    zero_inputs();
+    s = sapp_run_one_frame(inp);
+    SATURN_ASSERT_EQ(s->bg_image_ref, (const lobby_bg_image_t*)0);
+
+    /* SELECT -> PLAYING uses the active game's background. */
+    inp[0] = INP_A; s = sapp_run_one_frame(inp);
+    SATURN_ASSERT_EQ(s->bg_image_ref, &k_stub_bg);
 }
 
 SATURN_TEST(app_register_rejects_null) {
