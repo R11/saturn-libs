@@ -1,0 +1,17 @@
+# Project-wide clangd fallback for saturn-io. Per-TU flags come from
+# compile_commands.json (regenerated via `bear --output compile_commands.json
+# -- make -C tests/host all`).
+#
+# These fallbacks let clangd index public headers under include/saturn_io/
+# standalone — opening a header before clangd has indexed an including .c
+# would otherwise yield spurious "file not found" diagnostics.
+#
+# The Saturn cross-compile shell at examples/hello/ is suppressed
+# separately by examples/hello/.clangd.
+
+CompileFlags:
+  Add:
+    - -xc
+    - -std=c99
+    - -Iinclude
+    - -Isrc

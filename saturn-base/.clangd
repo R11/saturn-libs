@@ -1,0 +1,11 @@
+# saturn-base is header-only — there's nothing for `bear -- make` to
+# record, so clangd has no compile_commands.json to consult. These
+# fallback flags let it index the public headers (and font_8x8.c, which
+# consumers compile in directly) without spurious "file not found"
+# diagnostics.
+
+CompileFlags:
+  Add:
+    - -xc
+    - -std=c99
+    - -Iinclude

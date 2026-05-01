@@ -15,3 +15,8 @@ tests/host/test_*
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# clangd / language server (per-developer; regenerate via
+# `bear --output compile_commands.json -- make -C tests/host all`)
+compile_commands.json
+.cache/
