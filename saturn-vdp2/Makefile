@@ -4,7 +4,7 @@ CFLAGS   := -std=c99 -Wall -Wextra -Werror -Wpedantic -g -O0
 INCS     := -Iinclude -I../saturn-base/include -I../test/include
 BUILD    := build
 
-CORE_SRCS := core/saturn_vdp2_core.c
+CORE_SRCS := core/saturn_vdp2_core.c core/saturn_vdp2_bg_core.c
 CORE_OBJS := $(CORE_SRCS:core/%.c=$(BUILD)/core_%.o)
 LIB := $(BUILD)/libsaturn_vdp2.a
 

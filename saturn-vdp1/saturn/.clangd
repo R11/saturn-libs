@@ -1,0 +1,7 @@
+# Saturn cross-compile shell — clangd can't analyse this with the
+# host toolchain. Suppress all diagnostics here. Real validation
+# happens via the Docker SH-2 build (scripts/docker-saturn-build.sh
+# in the lobby) and via host tests of the lib's core/.
+
+Diagnostics:
+  Suppress: '*'
