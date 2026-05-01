@@ -1,26 +1,24 @@
 /*
- * tests/test_vote_timer.c — VOTE_TIMER state behaviour on the cart side.
+ * tests/test_vote_timer.c — VOTE_TIMER + COUNTDOWN behaviour in
+ * online-mode lobby.
  *
- * Server-side timer is exercised by the play_online_round.py integration
- * test. Here we verify that the cart:
- *   - Enters STATE_VOTE_TIMER when a VOTE_TIMER frame arrives.
- *   - Tracks the most recent seconds_remaining.
- *   - Advances to STATE_COUNTDOWN on GAME_PICK.
- *   - Advances to STATE_PLAYING_ONLINE on GAME_START.
- *   - Returns to GAME_SELECT_ONLINE if the timer is cleared (via GAME_PICK
- *     arriving without further VOTE_TIMER frames).
- *
- * Synthetic backend pattern mirrors test_game_select_online.c.
+ * Post-redesign there is no separate VOTE_TIMER state — the lobby
+ * remains in LOBBY_STATE_LOBBY with view=COUNTDOWN while the server
+ * is running its vote/countdown timers. GAME_START arrival flips
+ * to LOBBY_STATE_PLAYING_ONLINE.
  */
 
 #include <saturn_test/test.h>
 #include <saturn_app.h>
 #include "../net/sapp_net.h"
 #include "../net/sapp_proto.h"
+#include "../state/state_internal.h"
+#include "../state/state_online.h"
 
 #include <string.h>
 
 #define INP_START 0x0010
+#define INP_RIGHT 0x0001
 
 #define TX_BUF_CAP 1024u
 
@@ -67,6 +65,27 @@ static const lobby_game_t tg_game = {
     tg_init, tg_tick, tg_render, tg_done, tg_teardown, NULL
 };
 
+static void inject_room_state_alice(void) {
+    uint8_t buf[256];
+    size_t  off = 0;
+    sapp_proto_put_u8 (buf, &off, SAPP_MSG_ROOM_STATE);
+    sapp_proto_put_bytes(buf, &off, "ABCDEF", 6);
+    sapp_proto_put_u8 (buf, &off, 0);
+    sapp_proto_put_u8 (buf, &off, 0);
+    sapp_proto_put_u8 (buf, &off, 0);
+    sapp_proto_put_u8 (buf, &off, 8);
+    sapp_proto_put_u8 (buf, &off, 1);
+    sapp_proto_put_u32(buf, &off, 0);
+    sapp_proto_put_u8 (buf, &off, 0);
+    sapp_proto_put_u8 (buf, &off, 0);
+    { uint8_t u[16]={0}; sapp_proto_put_bytes(buf, &off, u, 16); }
+    sapp_proto_put_u8 (buf, &off, 0);
+    sapp_proto_put_u8 (buf, &off, 0);
+    sapp_proto_put_u8 (buf, &off, 5);
+    sapp_proto_put_bytes(buf, &off, "ALICE", 5);
+    s_recv_cb(buf, off, s_recv_user);
+}
+
 static void setup(void) {
     sapp_init(320, 224, 0xC0FFEEu);
     sapp_register_game(&tg_game);
@@ -75,13 +94,14 @@ static void setup(void) {
     sapp_set_identity(&id);
     memset(inp, 0, sizeof(inp));
     tx_len = 0; s_recv_cb = NULL; s_recv_user = NULL;
-    s_status = SAPP_NET_DISCONNECTED;
+    s_status = SAPP_NET_CONNECTED;
     sapp_net_install(&k_be);
-    extern void sapp_state_connecting_enter(void);
-    sapp_state_connecting_enter();
-    extern void sapp_state_game_select_online_enter(void);
-    sapp_state_game_select_online_enter();
-    sapp_force_state(LOBBY_STATE_GAME_SELECT_ONLINE);
+    sapp_online_install_recv();
+    sapp_online_ctx_reset();
+    sapp_force_state(LOBBY_STATE_LOBBY);
+    sapp_state_lobby_enter();
+    inject_room_state_alice();
+    sapp_run_one_frame(inp);
 }
 
 static void teardown(void) {
@@ -112,7 +132,8 @@ static void inject_game_start(uint8_t game_id, uint32_t seed) {
 SATURN_TEST(vote_timer_secs_track_inbound_ticks) {
     inject_vote_timer(5);
     sapp_run_one_frame(inp);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_VOTE_TIMER);
+    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOBBY);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_COUNTDOWN);
     SATURN_ASSERT_EQ(sapp_online_vote_timer_secs(), 5);
 
     inject_vote_timer(3);
@@ -123,12 +144,11 @@ SATURN_TEST(vote_timer_secs_track_inbound_ticks) {
 SATURN_TEST(vote_timer_then_pick_then_start) {
     inject_vote_timer(5);
     sapp_run_one_frame(inp);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_VOTE_TIMER);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_COUNTDOWN);
 
     inject_game_pick(0, 0x12345u);
     sapp_run_one_frame(inp);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_COUNTDOWN);
-    /* GAME_PICK clears the vote timer in the recv router. */
+    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOBBY);
     SATURN_ASSERT_EQ(sapp_online_vote_timer_secs(), 0xFF);
 
     inject_game_start(0, 0x12345u);
@@ -136,17 +156,18 @@ SATURN_TEST(vote_timer_then_pick_then_start) {
     SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_PLAYING_ONLINE);
 }
 
-SATURN_TEST(start_during_vote_timer_sends_ready) {
+SATURN_TEST(start_during_countdown_does_not_send_ready) {
+    /* In COUNTDOWN view input is no-op; verify START doesn't send
+     * additional READY frames. */
     inject_vote_timer(5);
     sapp_run_one_frame(inp);
 
     size_t pre = tx_len;
     inp[0] = INP_START; sapp_run_one_frame(inp);
     inp[0] = 0;         sapp_run_one_frame(inp);
-
     int found = -1;
     for (size_t i = pre; i + 2 < tx_len; ++i) {
         if (tx_buf[i + 2] == SAPP_MSG_READY) { found = (int)i; break; }
     }
-    SATURN_ASSERT_GE(found, 0);
+    SATURN_ASSERT_EQ(found, -1);
 }

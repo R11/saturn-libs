@@ -17,6 +17,25 @@ static sapp_online_ctx_t g_ctx;
 
 sapp_online_ctx_t* sapp_online_ctx(void) { return &g_ctx; }
 
+void sapp_online_ctx_reset(void)
+{
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    g_ctx.vote_timer_secs   = 0xFF;
+    g_ctx.countdown_secs    = 0xFF;
+    g_ctx.picked_game_id    = 0xFF;
+    g_ctx.last_drop_reason  = 0xFF;
+}
+
+static void recv_router(const uint8_t* body, size_t len, void* user) {
+    (void)user;
+    sapp_online_handle_frame(body, len);
+}
+
+void sapp_online_install_recv(void)
+{
+    sapp_net_set_recv(recv_router, NULL);
+}
+
 const sapp_room_list_t*  sapp_online_room_list (void) { return &g_ctx.list; }
 const sapp_room_state_t* sapp_online_room_state(void) { return &g_ctx.room; }
 const char*              sapp_online_status    (void) { return g_ctx.status; }

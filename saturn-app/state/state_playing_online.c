@@ -101,7 +101,7 @@ lobby_state_t sapp_state_playing_online_input(
     (void)prev;
     sapp_online_ctx_t* ctx = sapp_online_ctx();
 
-    if (!s_game) return LOBBY_STATE_IN_ROOM;
+    if (!s_game) return LOBBY_STATE_LOBBY;
 
     s_local_input = inputs ? inputs[0] : 0;
 

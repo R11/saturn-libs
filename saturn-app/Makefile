@@ -11,16 +11,8 @@ WIDGET_SRCS  := widgets/keyboard.c
 WIDGET_OBJS  := $(WIDGET_SRCS:widgets/%.c=$(BUILD)/widgets_%.o)
 
 STATE_SRCS   := state/state_name_entry.c \
-                state/state_local_lobby.c \
-                state/state_name_pick.c \
-                state/state_connecting.c \
-                state/state_lobby_list.c \
-                state/state_room_create.c \
-                state/state_in_room.c \
+                state/state_lobby.c \
                 state/state_online_ctx.c \
-                state/state_game_select_online.c \
-                state/state_vote_timer.c \
-                state/state_countdown.c \
                 state/state_playing_online.c \
                 state/state_results_online.c
 STATE_OBJS   := $(STATE_SRCS:state/%.c=$(BUILD)/state_%.o)

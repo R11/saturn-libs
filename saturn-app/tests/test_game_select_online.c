@@ -1,19 +1,26 @@
 /*
- * tests/test_game_select_online.c — vote encoding + state transitions for
- * STATE_GAME_SELECT_ONLINE / STATE_VOTE_TIMER / STATE_COUNTDOWN.
+ * tests/test_game_select_online.c — vote encoding + lifecycle in
+ * online-mode LOBBY.
  *
- * Synthetic backend pattern mirrors test_in_room.c.
+ * Post-redesign there is no separate GAME_SELECT_ONLINE state — the
+ * lobby's DEFAULT view (in online mode) handles vote commits via
+ * pad-N START, sending READY frames. VOTE_TIMER + GAME_PICK +
+ * GAME_START arriving from the server flip the lobby to its
+ * COUNTDOWN view, then to LOBBY_STATE_PLAYING_ONLINE on GAME_START.
  */
 
 #include <saturn_test/test.h>
 #include <saturn_app.h>
 #include "../net/sapp_net.h"
 #include "../net/sapp_proto.h"
+#include "../state/state_internal.h"
+#include "../state/state_online.h"
 
 #include <string.h>
 
 #define INP_DOWN  0x0004
 #define INP_UP    0x0008
+#define INP_RIGHT 0x0001
 #define INP_START 0x0010
 #define INP_A     0x0020
 #define INP_B     0x0040
@@ -51,13 +58,11 @@ static const sapp_net_backend_t k_be = {
 
 static lobby_input_t inp[LOBBY_MAX_PLAYERS];
 
-/* A trivial test game — registered so sapp_count_games() > 0. */
 static void tg_init(void* s, const lobby_game_config_t* c) { (void)s; (void)c; }
 static void tg_tick(void* s, const lobby_input_t i[LOBBY_MAX_PLAYERS]) { (void)s; (void)i; }
 static void tg_render(const void* s, lobby_scene_t* o) { (void)s; (void)o; }
 static void tg_done(const void* s, lobby_game_result_t* o) {
-    (void)s;
-    if (o) o->outcome = LOBBY_OUTCOME_RUNNING;
+    (void)s; if (o) o->outcome = LOBBY_OUTCOME_RUNNING;
 }
 static void tg_teardown(void* s) { (void)s; }
 static const lobby_game_t tg_game = {
@@ -69,6 +74,29 @@ static const lobby_game_t tg_game2 = {
     tg_init, tg_tick, tg_render, tg_done, tg_teardown, NULL
 };
 
+/* Inject a fake ROOM_STATE so the lobby flips into ONLINE mode. */
+static void inject_room_state_alice(void) {
+    uint8_t buf[256];
+    size_t  off = 0;
+    sapp_proto_put_u8 (buf, &off, SAPP_MSG_ROOM_STATE);
+    sapp_proto_put_bytes(buf, &off, "ABCDEF", 6);
+    sapp_proto_put_u8 (buf, &off, 0);  /* game_id */
+    sapp_proto_put_u8 (buf, &off, 0);  /* mode */
+    sapp_proto_put_u8 (buf, &off, 0);  /* host_slot */
+    sapp_proto_put_u8 (buf, &off, 8);  /* max */
+    sapp_proto_put_u8 (buf, &off, 1);  /* n */
+    sapp_proto_put_u32(buf, &off, 0);  /* tick */
+    sapp_proto_put_u8 (buf, &off, 0);  /* room_flags */
+    /* Member 0 */
+    sapp_proto_put_u8 (buf, &off, 0);
+    { uint8_t u[16]={0}; sapp_proto_put_bytes(buf, &off, u, 16); }
+    sapp_proto_put_u8 (buf, &off, 0);
+    sapp_proto_put_u8 (buf, &off, 0);
+    sapp_proto_put_u8 (buf, &off, 5);
+    sapp_proto_put_bytes(buf, &off, "ALICE", 5);
+    s_recv_cb(buf, off, s_recv_user);
+}
+
 static void setup(void) {
     sapp_init(320, 224, 0xC0FFEEu);
     sapp_register_game(&tg_game);
@@ -78,15 +106,15 @@ static void setup(void) {
     sapp_set_identity(&id);
     memset(inp, 0, sizeof(inp));
     tx_len = 0; s_recv_cb = NULL; s_recv_user = NULL;
-    s_status = SAPP_NET_DISCONNECTED;
+    s_status = SAPP_NET_CONNECTED;
     sapp_net_install(&k_be);
-    /* CONNECTING_enter installs the framework's recv router into the
-     * backend so injected frames land in the online ctx. */
-    extern void sapp_state_connecting_enter(void);
-    sapp_state_connecting_enter();
-    extern void sapp_state_game_select_online_enter(void);
-    sapp_state_game_select_online_enter();
-    sapp_force_state(LOBBY_STATE_GAME_SELECT_ONLINE);
+    sapp_online_install_recv();
+    sapp_online_ctx_reset();
+    sapp_force_state(LOBBY_STATE_LOBBY);
+    sapp_state_lobby_enter();
+    /* Inject a ROOM_STATE so the lobby is in ONLINE mode. */
+    inject_room_state_alice();
+    sapp_run_one_frame(inp);
 }
 
 static void teardown(void) {
@@ -103,64 +131,56 @@ static int find_msg_after(size_t start, uint8_t type) {
     return -1;
 }
 
-SATURN_TEST(start_sends_ready_with_current_cursor) {
-    /* Cursor starts at 0; START sends READY+vote=0+ready=1. */
-    inp[0] = INP_START;
-    sapp_run_one_frame(inp);
-    inp[0] = 0;
-    sapp_run_one_frame(inp);
+SATURN_TEST(start_in_games_column_sends_ready_with_cursor) {
+    /* Move cursor to GAMES column. */
+    inp[0] = INP_RIGHT; sapp_run_one_frame(inp);
+    inp[0] = 0;         sapp_run_one_frame(inp);
+    /* Pad 0 START commits vote on game 0. */
+    size_t pre = tx_len;
+    inp[0] = INP_START; sapp_run_one_frame(inp);
+    inp[0] = 0;         sapp_run_one_frame(inp);
 
-    int idx = find_msg_after(0, SAPP_MSG_READY);
+    int idx = find_msg_after(pre, SAPP_MSG_READY);
     SATURN_ASSERT_GE(idx, 0);
     SATURN_ASSERT_EQ(tx_buf[idx + 3], 1); /* ready */
     SATURN_ASSERT_EQ(tx_buf[idx + 4], 0); /* game_id */
 }
 
 SATURN_TEST(down_then_start_votes_for_second_game) {
-    inp[0] = INP_DOWN; sapp_run_one_frame(inp);
-    inp[0] = 0;        sapp_run_one_frame(inp);
+    /* Move to GAMES and DOWN to second game. */
+    inp[0] = INP_RIGHT; sapp_run_one_frame(inp);
+    inp[0] = 0;         sapp_run_one_frame(inp);
+    inp[0] = INP_DOWN;  sapp_run_one_frame(inp);
+    inp[0] = 0;         sapp_run_one_frame(inp);
+    size_t pre = tx_len;
     inp[0] = INP_START; sapp_run_one_frame(inp);
-    inp[0] = 0;        sapp_run_one_frame(inp);
+    inp[0] = 0;         sapp_run_one_frame(inp);
 
-    /* Find the latest READY frame. */
     int last = -1;
-    for (size_t i = 0; i + 2 < tx_len; ++i) {
+    for (size_t i = pre; i + 2 < tx_len; ++i) {
         if (tx_buf[i + 2] == SAPP_MSG_READY) last = (int)i;
     }
     SATURN_ASSERT_GE(last, 0);
-    SATURN_ASSERT_EQ(tx_buf[last + 3], 1); /* ready */
-    SATURN_ASSERT_EQ(tx_buf[last + 4], 1); /* game_id = 1 */
+    SATURN_ASSERT_EQ(tx_buf[last + 3], 1);
+    SATURN_ASSERT_EQ(tx_buf[last + 4], 1);
 }
 
-SATURN_TEST(start_twice_toggles_ready_off) {
-    inp[0] = INP_START; sapp_run_one_frame(inp);
-    inp[0] = 0;         sapp_run_one_frame(inp);
-    inp[0] = INP_START; sapp_run_one_frame(inp);
-    inp[0] = 0;         sapp_run_one_frame(inp);
-    /* The second READY should carry ready=0. */
-    int last = -1;
-    for (size_t i = 0; i + 2 < tx_len; ++i) {
-        if (tx_buf[i + 2] == SAPP_MSG_READY) last = (int)i;
-    }
-    SATURN_ASSERT_GE(last, 0);
-    SATURN_ASSERT_EQ(tx_buf[last + 3], 0); /* ready off */
-}
-
-SATURN_TEST(vote_timer_inbound_advances_to_vote_timer_state) {
+SATURN_TEST(vote_timer_inbound_flips_view_to_countdown) {
     uint8_t buf[4];
     size_t n = sapp_proto_encode_vote_timer(buf, sizeof(buf), 5);
     s_recv_cb(buf, n, s_recv_user);
     sapp_run_one_frame(inp);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_VOTE_TIMER);
+    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOBBY);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_COUNTDOWN);
     SATURN_ASSERT_EQ(sapp_online_vote_timer_secs(), 5);
 }
 
-SATURN_TEST(game_pick_inbound_advances_to_countdown) {
+SATURN_TEST(game_pick_inbound_keeps_countdown_view) {
     uint8_t buf[8];
     size_t n = sapp_proto_encode_game_pick(buf, sizeof(buf), 1, 0xABCDEFu);
     s_recv_cb(buf, n, s_recv_user);
     sapp_run_one_frame(inp);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_COUNTDOWN);
+    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOBBY);
     SATURN_ASSERT_EQ(sapp_online_picked_game_id(), 1);
     SATURN_ASSERT_EQ((long)sapp_online_round_seed(), (long)0xABCDEFu);
 }

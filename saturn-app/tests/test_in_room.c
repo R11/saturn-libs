@@ -1,18 +1,25 @@
 /*
- * tests/test_in_room.c — drive the IN_ROOM state via a synthetic backend.
+ * tests/test_in_room.c — drive the lobby's online mode via a synthetic
+ * backend.
  *
- * The synthetic backend captures outbound frames into a buffer and lets
- * the test inject ROOM_STATE frames into the recv path.
+ * Post-redesign there is no separate IN_ROOM state; "in a room" is the
+ * lobby with mode == ONLINE (set automatically when a ROOM_STATE arrives
+ * with valid=true). The action row shows LEAVE; pressing A on it (or B
+ * from anywhere) sends ROOM_LEAVE and drops back to offline mode.
  */
 
 #include <saturn_test/test.h>
 #include <saturn_app.h>
 #include "../net/sapp_net.h"
 #include "../net/sapp_proto.h"
+#include "../state/state_online.h"
+#include "../state/state_internal.h"
 
 #include <string.h>
 
-#define INP_B 0x0040
+#define INP_DOWN  0x0004
+#define INP_A     0x0020
+#define INP_B     0x0040
 
 #define TX_BUF_CAP 1024u
 
@@ -49,13 +56,12 @@ static lobby_input_t inp[LOBBY_MAX_PLAYERS];
 
 static void setup(void) {
     sapp_init(320, 224, 0xC0FFEEu);
-    /* Install a synthetic identity so HELLO encoding succeeds. */
     sapp_identity_t id;
     sapp_identity_default(&id);
     memcpy(id.current_name, "ALICE", 6);
     sapp_set_identity(&id);
-    /* Force into LOCAL_LOBBY by entering the state machine briefly. */
-    sapp_force_state(LOBBY_STATE_LOCAL_LOBBY);
+    sapp_force_state(LOBBY_STATE_LOBBY);
+    sapp_state_lobby_enter();
     memset(inp, 0, sizeof(inp));
 
     tx_len = 0; s_recv_cb = NULL; s_recv_user = NULL; s_status = SAPP_NET_DISCONNECTED;
@@ -69,17 +75,21 @@ static void teardown(void) {
 
 SATURN_TEST_FIXTURE(setup, teardown);
 
-/* Push the framework into CONNECTING then drive past HELLO_ACK by injecting
- * a synthetic frame. The framework should land in LOBBY_LIST. */
+/* Drive lobby into online mode by injecting CONNECT view + HELLO_ACK +
+ * ROOM_STATE. */
 static void drive_to_in_room(void) {
-    sapp_force_state(LOBBY_STATE_CONNECTING);
-    /* CONNECTING needs an explicit enter when forced. */
-    extern void sapp_state_connecting_enter(void);
-    sapp_state_connecting_enter();
+    /* DOWN through 8 slots to reach ACTION row. cursor_action defaults
+     * to 0 (CONNECT). A activates -> CONNECTING view. */
+    for (unsigned i = 0; i < SAPP_LOBBY_SLOTS; ++i) {
+        inp[0] = INP_DOWN; sapp_run_one_frame(inp);
+        inp[0] = 0;        sapp_run_one_frame(inp);
+    }
+    inp[0] = INP_A; sapp_run_one_frame(inp);
+    inp[0] = 0;     sapp_run_one_frame(inp);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_CONNECTING);
 
-    /* One frame: connect + send HELLO. */
+    /* CONNECTING view runs connect + sends HELLO. Pump one frame. */
     sapp_run_one_frame(inp);
-    /* Verify we sent a HELLO. */
     SATURN_ASSERT_GE(tx_len, 2u);
     SATURN_ASSERT_EQ(tx_buf[2], SAPP_MSG_HELLO);
 
@@ -90,12 +100,10 @@ static void drive_to_in_room(void) {
                                             SAPP_PROTO_VER, 0u, uuid, 0);
     SATURN_ASSERT_GT(n, 0);
     s_recv_cb(ack, n, s_recv_user);
-
-    /* Next frame -> LOBBY_LIST. */
     sapp_run_one_frame(inp);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOBBY_LIST);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_LOBBY_LIST);
 
-    /* Inject a ROOM_STATE so the LOBBY_LIST input observer auto-advances. */
+    /* Inject a ROOM_STATE so the lobby auto-enters online mode. */
     uint8_t buf[256];
     size_t  off = 0;
     sapp_proto_put_u8 (buf, &off, SAPP_MSG_ROOM_STATE);
@@ -104,10 +112,9 @@ static void drive_to_in_room(void) {
     sapp_proto_put_u8 (buf, &off, 0);
     sapp_proto_put_u8 (buf, &off, 0);
     sapp_proto_put_u8 (buf, &off, 8);
-    sapp_proto_put_u8 (buf, &off, 1);    /* n */
+    sapp_proto_put_u8 (buf, &off, 1);
     sapp_proto_put_u32(buf, &off, 0);
     sapp_proto_put_u8 (buf, &off, 0);
-    /* Member 0 */
     sapp_proto_put_u8 (buf, &off, 0);
     { uint8_t u[16]={0}; sapp_proto_put_bytes(buf, &off, u, 16); }
     sapp_proto_put_u8 (buf, &off, 0);
@@ -116,12 +123,13 @@ static void drive_to_in_room(void) {
     sapp_proto_put_bytes(buf, &off, "ALICE", 5);
     s_recv_cb(buf, off, s_recv_user);
 
-    /* Next frame -> IN_ROOM. */
     sapp_run_one_frame(inp);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_IN_ROOM);
+    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOBBY);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_DEFAULT);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->mode, SAPP_LOBBY_MODE_ONLINE);
 }
 
-SATURN_TEST(in_room_state_transition_via_room_state) {
+SATURN_TEST(online_mode_entered_via_room_state) {
     drive_to_in_room();
     const sapp_room_state_t* rs = sapp_online_room_state();
     SATURN_ASSERT(rs->valid);
@@ -129,19 +137,39 @@ SATURN_TEST(in_room_state_transition_via_room_state) {
     SATURN_ASSERT_STR_EQ(rs->members[0].name, "ALICE");
 }
 
-SATURN_TEST(in_room_b_sends_leave_and_returns_to_lobby_list) {
+SATURN_TEST(online_b_anywhere_does_not_send_leave_yet) {
+    /* In the new design, B in the default-online view is unbound (the
+     * action row's LEAVE button must be activated). Just sanity-check
+     * online mode persists when B is pressed in DEFAULT view. */
     drive_to_in_room();
     size_t pre_tx = tx_len;
-    inp[0] = INP_B;
-    sapp_run_one_frame(inp);
-    inp[0] = 0;
-    sapp_run_one_frame(inp);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOBBY_LIST);
-    SATURN_ASSERT_GT(tx_len, pre_tx);
-    /* Find the LEAVE byte we expect somewhere after pre_tx. */
+    inp[0] = INP_B; sapp_run_one_frame(inp);
+    inp[0] = 0;     sapp_run_one_frame(inp);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->mode, SAPP_LOBBY_MODE_ONLINE);
+    /* No LEAVE sent (B in DEFAULT is a no-op in the unified lobby). */
+    int found = 0;
+    for (size_t i = pre_tx; i + 2 < tx_len; ++i) {
+        if (tx_buf[i + 2] == SAPP_MSG_ROOM_LEAVE) { found = 1; break; }
+    }
+    SATURN_ASSERT(!found);
+}
+
+SATURN_TEST(online_action_leave_sends_leave_and_returns_to_offline) {
+    drive_to_in_room();
+    /* Move cursor to action row. Up to 10 DOWNs (wrap-safe). */
+    for (unsigned i = 0; i < 10 && sapp_lobby_get()->focus != SAPP_LOBBY_FOCUS_ACTION; ++i) {
+        inp[0] = INP_DOWN; sapp_run_one_frame(inp);
+        inp[0] = 0;        sapp_run_one_frame(inp);
+    }
+    SATURN_ASSERT_EQ(sapp_lobby_get()->focus, SAPP_LOBBY_FOCUS_ACTION);
+    size_t pre_tx = tx_len;
+    inp[0] = INP_A; sapp_run_one_frame(inp);
+    inp[0] = 0;     sapp_run_one_frame(inp);
+    /* LEAVE sent and mode flipped back to offline. */
     int found = 0;
     for (size_t i = pre_tx; i + 2 < tx_len; ++i) {
         if (tx_buf[i + 2] == SAPP_MSG_ROOM_LEAVE) { found = 1; break; }
     }
     SATURN_ASSERT(found);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->mode, SAPP_LOBBY_MODE_OFFLINE);
 }

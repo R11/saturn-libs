@@ -71,8 +71,10 @@ static void setup(void) {
     tx_len = 0; s_recv_cb = NULL; s_recv_user = NULL;
     s_status = SAPP_NET_DISCONNECTED;
     sapp_net_install(&k_be);
-    extern void sapp_state_connecting_enter(void);
-    sapp_state_connecting_enter();
+    extern void sapp_online_install_recv(void);
+    extern void sapp_online_ctx_reset(void);
+    sapp_online_ctx_reset();
+    sapp_online_install_recv();
 }
 
 static void teardown(void) {
@@ -156,8 +158,10 @@ SATURN_TEST(slot_drop_cleared_on_game_start) {
 
 SATURN_TEST(playing_continues_through_drops) {
     /* Force playing-online state with our test game. Drive through
-     * COUNTDOWN -> PLAYING_ONLINE via injected GAME_START. */
-    sapp_force_state(LOBBY_STATE_COUNTDOWN);
+     * lobby (online) -> PLAYING_ONLINE via injected GAME_START. */
+    extern void sapp_state_lobby_enter(void);
+    sapp_force_state(LOBBY_STATE_LOBBY);
+    sapp_state_lobby_enter();
     inject_game_start(0, 0x1234u, 2);
     sapp_run_one_frame(inp);
     SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_PLAYING_ONLINE);

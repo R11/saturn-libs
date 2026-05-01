@@ -1,5 +1,9 @@
 /*
  * tests/test_name_pick.c — name-pick + new-name keyboard transitions.
+ *
+ * Post-redesign the name-pick + new-name-keyboard live as right-panel
+ * VIEWS of the unified LOBBY state, not as separate top-level states.
+ * The behaviour is unchanged.
  */
 
 #include <saturn_test/test.h>
@@ -88,20 +92,16 @@ static void tap_menu(uint16_t mask) {
 /* ------------------------------------------------------------------ */
 
 SATURN_TEST(pick_default_skips_names_seated_in_other_slots) {
-    /* Roster ALICE,BOB. ALICE seated in slot 0. Open NAME_PICK for slot 1
-     * — default should be BOB (next free). */
     const char* extra[] = {"BOB"};
     seed_identity("ALICE", extra, 1);
     sapp_bootstrap_identity();
 
-    /* Cursor down to slot 1, A. */
     tap_menu(BTN_DOWN);
     tap_menu(BTN_A);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_NAME_PICK);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_NAME_PICK);
 
-    /* Confirm immediately; should seat BOB. */
     tap_menu(BTN_A);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOCAL_LOBBY);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_DEFAULT);
     SATURN_ASSERT_STR_EQ(sapp_lobby_get()->seated_name[1], "BOB");
 }
 
@@ -110,10 +110,8 @@ SATURN_TEST(pick_left_right_cycles_available_names) {
     seed_identity("ALICE", extra, 2);
     sapp_bootstrap_identity();
 
-    tap_menu(BTN_DOWN);   /* cursor->slot 1 */
-    tap_menu(BTN_A);      /* enter NAME_PICK */
-    /* Default options: BOB,CAROL (ALICE excluded — seated in slot 0).
-     * RIGHT moves cursor to CAROL. */
+    tap_menu(BTN_DOWN);
+    tap_menu(BTN_A);
     tap_menu(BTN_RIGHT);
     tap_menu(BTN_A);
     SATURN_ASSERT_STR_EQ(sapp_lobby_get()->seated_name[1], "CAROL");
@@ -124,10 +122,9 @@ SATURN_TEST(pick_b_on_guest_slot_unseats) {
     seed_identity("ALICE", extra, 1);
     sapp_bootstrap_identity();
 
-    tap_menu(BTN_DOWN); tap_menu(BTN_A);     /* enter NAME_PICK slot 1 */
-    tap_menu(BTN_B);                          /* cancel */
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOCAL_LOBBY);
-    /* Guest slot 1 was never seated to begin with — still unseated. */
+    tap_menu(BTN_DOWN); tap_menu(BTN_A);
+    tap_menu(BTN_B);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_DEFAULT);
     SATURN_ASSERT_EQ(sapp_lobby_get()->seated[1], 0);
 }
 
@@ -136,13 +133,11 @@ SATURN_TEST(pick_b_on_seated_guest_unseats) {
     seed_identity("ALICE", extra, 1);
     sapp_bootstrap_identity();
 
-    /* Seat slot 1 first. */
-    tap_menu(BTN_DOWN); tap_menu(BTN_A); tap_menu(BTN_A);   /* seat BOB */
+    tap_menu(BTN_DOWN); tap_menu(BTN_A); tap_menu(BTN_A);
     SATURN_ASSERT_EQ(sapp_lobby_get()->seated[1], 1);
 
-    /* Re-open and cancel — should un-seat. */
     tap_menu(BTN_A);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_NAME_PICK);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_NAME_PICK);
     tap_menu(BTN_B);
     SATURN_ASSERT_EQ(sapp_lobby_get()->seated[1], 0);
 }
@@ -152,14 +147,11 @@ SATURN_TEST(pick_b_on_slot0_does_not_unseat) {
     seed_identity("ALICE", extra, 1);
     sapp_bootstrap_identity();
 
-    /* Cursor on slot 0 already. A -> NAME_PICK -> B. */
     tap_menu(BTN_A);
     tap_menu(BTN_B);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOCAL_LOBBY);
-    /* Slot 0 stays seated as ALICE (re-seated on lobby_enter). */
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_DEFAULT);
     SATURN_ASSERT_EQ(sapp_lobby_get()->seated[0], 1);
     SATURN_ASSERT_STR_EQ(sapp_lobby_get()->seated_name[0], "ALICE");
-    /* Identity unchanged. */
     sapp_identity_t id;
     SATURN_ASSERT(sapp_identity_load(&id));
     SATURN_ASSERT_STR_EQ(id.current_name, "ALICE");
@@ -170,12 +162,10 @@ SATURN_TEST(pick_a_on_slot0_swaps_current_name_and_persists) {
     seed_identity("ALICE", extra, 1);
     sapp_bootstrap_identity();
 
-    /* Cursor on slot 0 — open picker. Default cursor lands on the
-     * currently-seated name (ALICE) for slot 0. RIGHT -> BOB. A. */
     tap_menu(BTN_A);
     tap_menu(BTN_RIGHT);
     tap_menu(BTN_A);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOCAL_LOBBY);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_DEFAULT);
     SATURN_ASSERT_STR_EQ(sapp_lobby_get()->seated_name[0], "BOB");
 
     sapp_identity_t id;
@@ -184,29 +174,24 @@ SATURN_TEST(pick_a_on_slot0_swaps_current_name_and_persists) {
 }
 
 SATURN_TEST(pick_new_name_via_keyboard_adds_to_roster_and_returns) {
-    seed_identity("ALICE", NULL, 0);   /* roster=[ALICE] only */
+    seed_identity("ALICE", NULL, 0);
     sapp_bootstrap_identity();
 
-    tap_menu(BTN_DOWN); tap_menu(BTN_A);      /* NAME_PICK slot 1 */
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_NAME_PICK);
+    tap_menu(BTN_DOWN); tap_menu(BTN_A);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_NAME_PICK);
 
-    /* Press START (=Y) to open keyboard. */
     tap_menu(BTN_START);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_NAME_ENTRY_NEW);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_NEW_NAME_KBD);
 
-    /* Type 'A' (cell 0,0) and START to commit. */
+    tap_menu(BTN_A);       /* type 'A' */
+    tap_menu(BTN_START);   /* commit */
+
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_NAME_PICK);
+
     tap_menu(BTN_A);
-    tap_menu(BTN_START);
-
-    /* Back in NAME_PICK with the new name preselected. */
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_NAME_PICK);
-
-    /* Confirm: A -> seats slot 1 with "A". */
-    tap_menu(BTN_A);
-    SATURN_ASSERT_EQ(sapp_state(), LOBBY_STATE_LOCAL_LOBBY);
+    SATURN_ASSERT_EQ(sapp_lobby_get()->view, SAPP_LOBBY_VIEW_DEFAULT);
     SATURN_ASSERT_STR_EQ(sapp_lobby_get()->seated_name[1], "A");
 
-    /* Roster includes the new name. */
     sapp_identity_t id;
     SATURN_ASSERT(sapp_identity_load(&id));
     int found_alice = 0, found_a = 0;

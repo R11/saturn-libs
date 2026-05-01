@@ -40,7 +40,7 @@ lobby_state_t sapp_state_results_online_input(lobby_input_t now, lobby_input_t p
     if (pressed(now, prev, INP_START) || pressed(now, prev, INP_A)
         || pressed(now, prev, INP_B) || s_frames > 180) {
         ctx->round_ended = false;
-        return LOBBY_STATE_IN_ROOM;
+        return LOBBY_STATE_LOBBY;
     }
     return LOBBY_STATE_RESULTS_ONLINE;
 }
