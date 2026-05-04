@@ -27,6 +27,3 @@ worktrees/
 # clangd / language server (per-developer; regenerate via `bear -- make`)
 compile_commands.json
 .cache/
-
-# Migration leftovers
-saturn-io.tomove/
