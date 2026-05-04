@@ -60,9 +60,11 @@ ships a Python bridge under `python/`).
 
 ## Toolchain
 
-- **Host tests** need only `cc` (gcc or clang) plus `make`. The CI job
-  installs `build-essential` on ubuntu-latest and runs `make test-tap`
-  at the repo root.
+- **Host tests** need `cc` (gcc or clang) plus `make`. `saturn-io`'s
+  test suite additionally needs `python3` + `pytest` (skipped with a
+  notice if absent). The CI job installs `build-essential` and
+  `python3-pytest` on ubuntu-latest and runs `make test-tap` at the
+  repo root.
 - **Saturn cross-compile** needs an SH-2 GCC toolchain. The reference
   path is the Docker SDK shipped with `R11/saturn-tools`
   (`saturn/sdk/docker-saturn-build.sh`). Per-lib Makefiles read
