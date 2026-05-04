@@ -10,6 +10,8 @@
  * complete we hand the body to the registered recv callback.
  */
 
+#define _DEFAULT_SOURCE  /* getaddrinfo, struct addrinfo on glibc */
+
 #include "sapp_net.h"
 
 #include <arpa/inet.h>
