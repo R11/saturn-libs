@@ -5,6 +5,8 @@
  * are independent and the user's real ~/.lobby_bup is never touched.
  */
 
+#define _DEFAULT_SOURCE  /* mkdtemp on glibc */
+
 #include <saturn_test/test.h>
 #include <saturn_bup.h>
 #include <saturn_bup/host.h>

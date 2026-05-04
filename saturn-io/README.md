@@ -168,9 +168,9 @@ saturn-io/
 - **Not a DreamPi client.**  A DreamPi-targeting transport fits cleanly
   on top of the `saturn_io_transport_t` shape (and the config's
   `transport` override is wired for exactly this), but this first cut
-  ships the UART + Python-bridge path only.  DreamPi integration
-  lives in a separate project ([R11/Netlink](https://github.com/R11/Netlink))
-  and is out of scope here.
+  ships the UART + Python-bridge path only.  DreamPi integration is
+  out of scope here — see the original
+  [eaudunord/Netlink](https://github.com/eaudunord/Netlink) project.
 - **Not a Sega XMP SDK wrapper.**  The Hitachi-COFF / GCC-ELF toolchain
   mismatch that blocks XMP is a separate, deferred problem.  This
   library talks to the 16550 directly.
