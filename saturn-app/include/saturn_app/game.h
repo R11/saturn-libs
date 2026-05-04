@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define LOBBY_MAX_PLAYERS    8u
+#define LOBBY_MAX_PLAYERS    8
 
 /* Optional per-game background image. The platform shell (Saturn lobby
  * shell) reads this to upload an NBG1 backdrop while a game is in
