@@ -1,0 +1,7 @@
+# Saturn cross-compile shell — clangd can't analyse this with the
+# host toolchain (SGL headers, SH-2 toolchain, __SATURN__ define).
+# Suppress all diagnostics here. Real validation happens via the
+# Docker SH-2 build.
+
+Diagnostics:
+  Suppress: '*'
