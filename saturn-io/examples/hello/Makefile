@@ -2,9 +2,9 @@
 # examples/hello/Makefile - build the saturn-io hello example
 #
 # This builds a Saturn ROM image using the SH-2 toolchain + SGL inside
-# the saturn-tools Docker SDK.  Toolchain paths match the canvas app
-# at retro/saturn/tools/saturn-tools/saturn/apps/canvas/Makefile so the
-# existing `scripts/docker-saturn-build.sh` works against this tree.
+# a saturn-tools-style Docker SDK.  Toolchain paths follow the standard
+# /opt/saturn-sdk layout so `docker-saturn-build.sh` works against this
+# tree (see https://github.com/R11/saturn-tools for the SDK).
 #
 
 SATURN_SDK_ROOT ?= /opt/saturn-sdk

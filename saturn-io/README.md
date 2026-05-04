@@ -35,7 +35,7 @@ in your consumer code.
 In your game's `Makefile`:
 
 ```make
-LIB_SATURN_IO = /path/to/retro/saturn/libs/saturn-io
+LIB_SATURN_IO = /path/to/saturn-libs/saturn-io
 CCFLAGS += -I$(LIB_SATURN_IO)/include
 CCFLAGS += -I$(LIB_SATURN_IO)/src     # for saturn_io_internal.h
 SRCS    += $(LIB_SATURN_IO)/src/net.c
@@ -121,15 +121,15 @@ python3 tools/bridge.py --mock --server 127.0.0.1:4821
 ## Building the hello example
 
 ```bash
-# From retro/saturn/libs/saturn-io/:
+# From the saturn-io/ subdir of this repo:
 make example
 ```
 
-The `examples/hello/Makefile` targets the same SH-2 toolchain +
-SGL layout as `saturn-tools`' `saturn/apps/canvas/Makefile`.  If you
-don't have an SH-2 GCC locally, use saturn-tools' Docker SDK
-(`retro/saturn/tools/saturn-tools/saturn/sdk/docker-saturn-build.sh`)
-and point it at `retro/saturn/libs/saturn-io/examples/hello/`.
+The `examples/hello/Makefile` targets a standard SH-2 GCC + SGL
+layout. If you don't have an SH-2 toolchain locally, the
+[saturn-tools](https://github.com/R11/saturn-tools) repo ships a
+Docker-based SDK (`saturn/sdk/docker-saturn-build.sh`) you can point
+at `saturn-io/examples/hello/`.
 
 ## Layout
 
@@ -168,8 +168,9 @@ saturn-io/
 - **Not a DreamPi client.**  A DreamPi-targeting transport fits cleanly
   on top of the `saturn_io_transport_t` shape (and the config's
   `transport` override is wired for exactly this), but this first cut
-  ships the UART + Python-bridge path only.  DreamPi integration lives
-  in `retro/saturn/apps/netlink/` and is out of scope here.
+  ships the UART + Python-bridge path only.  DreamPi integration
+  lives in a separate project ([R11/Netlink](https://github.com/R11/Netlink))
+  and is out of scope here.
 - **Not a Sega XMP SDK wrapper.**  The Hitachi-COFF / GCC-ELF toolchain
   mismatch that blocks XMP is a separate, deferred problem.  This
   library talks to the 16550 directly.
